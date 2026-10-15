@@ -8,7 +8,7 @@
  * `@[400px]:` class application visually.
  */
 
-import { act, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import type { SessionConfigOption } from '@/lib/acp-api'
@@ -20,21 +20,43 @@ import { CHAT_GUTTER_X, NARROW_PANE_PX } from './chat-layout'
 import type { TimelineItem } from './chat-timeline'
 import { PlanPanel } from './PlanPanel'
 
-const { mockMcpCount } = vi.hoisted(() => ({
-  mockMcpCount: { current: 2 }
+const { mockMcpCount, mockSetMcpServerEnabled, mockLoadMcpTools } = vi.hoisted(() => ({
+  mockMcpCount: { current: 2 },
+  mockSetMcpServerEnabled: vi.fn(async () => {}),
+  mockLoadMcpTools: vi.fn(async () => {})
 }))
 
 vi.mock('@/hooks/use-agent-skills', () => ({
   useAgentSkills: () => ({ skills: [] }),
-  buildPromptWithLoadedSkill: vi.fn(async (_skill, text: string) => text)
+  buildPromptWithLoadedSkills: vi.fn((_skills: unknown, text: string) => text)
 }))
 
 vi.mock('@/stores/acp-store', () => ({
-  useAcpStore: (selector: (s: { mcpServers: unknown[] }) => unknown) =>
-    selector({ mcpServers: Array.from({ length: mockMcpCount.current }) }),
+  useAcpStore: (selector: (s: Record<string, unknown>) => unknown) =>
+    selector({
+      sessions: {} as Record<string, unknown>,
+      mcpServers: Array.from({ length: mockMcpCount.current }, (_, i) => ({
+        id: `mcp-${i}`,
+        type: 'stdio',
+        name: `MCP ${i + 1}`,
+        command: 'npx',
+        enabled: true
+      })),
+      setMcpServerEnabled: mockSetMcpServerEnabled,
+      mcpProbeStatus: {} as Record<string, string>,
+      mcpProbeError: {} as Record<string, string | undefined>,
+      mcpTools: {} as Record<string, unknown[]>,
+      mcpToolsLoaded: {} as Record<string, boolean>,
+      mcpProbing: {} as Record<string, boolean>,
+      loadMcpTools: mockLoadMcpTools
+    }),
   useAcpMessages: () => [],
   useSessionUsage: () => null,
-  useAgentIdentity: () => ({ name: 'Cursor', templateId: 'cursor' })
+  // ChatInputBar resolves the model-chip glyph via the config-first
+  // selectors (armed-switch icon fix) — stub them to the same Cursor
+  // identity the old useAgentIdentity stub served.
+  useAgentTemplateId: () => 'cursor',
+  useAgentIcon: () => null
 }))
 
 type ObserverEntry = { target: Element; contentRect: { width: number } }
@@ -190,7 +212,6 @@ describe('Story 5.1 responsive chat layout', () => {
         <ChatMessageList
           items={[timelineItem]}
           sessionId="session-1"
-          agentId="agent-1"
           showRunningIndicator={false}
         />
       </TooltipProvider>
@@ -257,7 +278,8 @@ describe('Story 5.1 responsive chat layout', () => {
       option('model', 'Model', 'model', 'composer', [{ value: 'composer', name: 'composer-2.5' }]),
       option('thought_level', 'Thinking', 'thought_level', 'high', [
         { value: 'high', name: 'High' }
-      ])
+      ]),
+      option('custom', 'Tools', 'other', 'alpha', [{ value: 'alpha', name: 'Alpha' }])
     ]
 
     render(
@@ -285,16 +307,30 @@ describe('Story 5.1 responsive chat layout', () => {
     const row1 = toolbar?.querySelector('[data-composer-toolbar-row="1"]')
     const row2 = toolbar?.querySelector('[data-composer-toolbar-row="2"]')
     expect(row1).toBeTruthy()
-    expect(row2).toBeTruthy()
+    expect(row2).toBeNull()
     expect(toolbar?.querySelector('[data-composer-toolbar-row="single"]')).toBeNull()
 
     expect(within(row1 as HTMLElement).getByRole('button', { name: /^Agent$/ })).toBeInTheDocument()
     expect(
-      within(row1 as HTMLElement).getByRole('button', { name: 'composer-2.5' })
+      within(row1 as HTMLElement).getByRole('button', { name: /composer-2\.5/ })
     ).toBeInTheDocument()
+    expect(
+      within(row1 as HTMLElement).queryByRole('button', { name: 'High' })
+    ).not.toBeInTheDocument()
+    expect(
+      within(row1 as HTMLElement).queryByRole('button', { name: 'Alpha' })
+    ).not.toBeInTheDocument()
 
-    expect(within(row2 as HTMLElement).getByRole('button', { name: 'High' })).toBeInTheDocument()
-    expect(within(row2 as HTMLElement).getByText(/MCP servers attached/i)).toBeInTheDocument()
+    fireEvent.click(within(row1 as HTMLElement).getByTestId('agent-model-selector-trigger'))
+    // Generic options are footer tracks: the option name labels the track.
+    const tools = screen.getByRole('group', { name: 'Tools' })
+    expect(within(tools).getByRole('button', { name: 'Alpha' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    )
+    expect(
+      within(toolbar as HTMLElement).getByRole('button', { name: /MCP servers/i })
+    ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Send message/i })).toBeInTheDocument()
   })
 

@@ -32,12 +32,18 @@
 import { createRoot } from 'react-dom/client'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import App from './App'
-import { preloadCommonLanguages } from './hooks/use-codemirror'
 import { installGlobalErrorForwarding } from './lib/log-api'
-import './index.css'
-// Streamdown streaming animation keyframes (sd-fadeIn / sd-blurIn / sd-slideUp),
-// used by AgentProse's `animated` word-by-word reveal.
+// Import fontsource CSS as Vite CSS modules so its relative .woff2 URLs are
+// resolved and emitted as local build assets.
+import '@fontsource-variable/inter/index.css'
+import '@fontsource-variable/inter/wght-italic.css'
+import '@fontsource-variable/jetbrains-mono/index.css'
+import '@fontsource-variable/jetbrains-mono/wght-italic.css'
+import { registerServiceWorker } from './lib/pwa-register'
+// Streamdown keyframes load first. index.css then overrides sd-blurIn
+// so the chat stream resolves through a 1px blur.
 import 'streamdown/styles.css'
+import './index.css'
 
 /**
  * Bootstrap the appropriate app component based on runtime context
@@ -47,16 +53,15 @@ import 'streamdown/styles.css'
  */
 const root = createRoot(document.getElementById('root')!)
 
-// Prime CodeMirror language caches (js/ts/json) so the first open of these
-// common file types doesn't pay the dynamic-import latency. Fire-and-forget;
-// runs in parallel with React bootstrap (issue #378). Does not pull Tauri.
-preloadCommonLanguages()
+// Forward uncaught renderer errors + unhandled rejections to the backend log
+// file so production crashes are diagnosable (issue #244). Runs in BOTH modes:
+// - Tauri: invokes the `log_frontend_error` command (desktop log file).
+// - Web: POSTs to `/log/frontend-error` (the web branch in `logFrontendError`
+//   was added in Phase 2.3; the server reuses the same sanitization + tracing).
+// `installGlobalErrorForwarding` is idempotent and a no-op outside a browser.
+installGlobalErrorForwarding()
 
 if (isTauriContext()) {
-  // Forward uncaught renderer errors + unhandled rejections to the backend log
-  // file so production crashes are diagnosable (issue #244). Tauri-only: the
-  // browser/web path has no backend command to call.
-  installGlobalErrorForwarding()
   void import('./TauriApp')
     .then(({ default: TauriApp }) => {
       root.render(<TauriApp />)
@@ -67,4 +72,25 @@ if (isTauriContext()) {
     })
 } else {
   root.render(<App />)
+  // PWA: gated SW registration (secure-context web client only). Deferred to
+  // window load internally and never blocks or throws — see pwa-register.ts.
+  registerServiceWorker()
 }
+
+// Prime CodeMirror language caches (js/ts/json) so the first open of these
+// common file types doesn't pay the dynamic-import latency. Fire-and-forget;
+// deferred until after first paint + browser idle (requestIdleCallback, with a
+// setTimeout fallback for browsers without it) so it never competes with first
+// contentful paint (issue #378). Dynamic import keeps CodeMirror core out of the
+// entry chunk's critical path.
+const runIdle = (fn: () => void): void => {
+  const fallback = window.setTimeout
+  if ('requestIdleCallback' in window) {
+    window.requestIdleCallback(fn, { timeout: 2000 })
+  } else {
+    fallback(fn, 1_000)
+  }
+}
+runIdle(() => {
+  void import('./hooks/use-codemirror').then((m) => m.preloadCommonLanguages())
+})

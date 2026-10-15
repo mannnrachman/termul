@@ -1,5 +1,5 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   MessageScroller,
   MessageScrollerButton,
@@ -9,16 +9,29 @@ import {
   MessageScrollerViewport,
   useMessageScroller
 } from '@/components/ui/message-scroller'
-import type { AgentId, SessionId } from '@/lib/acp-api'
+import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
+import type { AgentId, SessionId, ToolCall } from '@/lib/acp-api'
+import type { FilePathResolutionContext } from '@/lib/file-path-links'
 import { cn } from '@/lib/utils'
 import { useAcpStore } from '@/stores/acp-store'
+import { AgentSwitchSeparator } from './AgentSwitchSeparator'
 import { ChatEmptyState } from './ChatEmptyState'
 import { ChatMessage } from './ChatMessage'
 import { CHAT_GUTTER_X } from './chat-layout'
-import { groupTurnActivity, type TimelineItem, type TurnTimelineItem } from './chat-timeline'
+import {
+  groupTurnActivity,
+  stabilizedTimeline,
+  type TimelineItem,
+  type TurnTimelineItem
+} from './chat-timeline'
+import { opencodeStatusLine } from './opencode-status'
+import { RowReveal } from './RowReveal'
+import { SubagentDetailsDialog } from './SubagentDetailsDialog'
 import { ThoughtGroup } from './ThoughtGroup'
 import { ToolCallCard } from './ToolCallCard'
 import { TurnActivity } from './TurnActivity'
+import { type EnterTracker, useEnterTracker } from './use-enter-tracker'
+import { WorktreeCreationCard } from './WorktreeCreationCard'
 
 /** Reports the live item count to the scroller so the jump button can badge unread. */
 function ItemCountReporter({ count }: { count: number }): null {
@@ -33,14 +46,14 @@ interface ChatMessageListProps {
   items: TimelineItem[]
   /** Active session — resets enter-animation baseline on switch. */
   sessionId: SessionId
-  /** Agent behind this session (drives the agent name/icon on replies). */
-  agentId: AgentId
   /** True for the complete duration of an in-flight agent turn. */
   showRunningIndicator: boolean
   /** Seed the composer with a user message's text (edit affordance). */
   onEditMessage?: (text: string) => void
   /** Re-run the latest user turn (regenerate affordance on agent replies). */
   onRetry?: () => void
+  /** Filesystem roots used for safe file-path links in agent prose. */
+  filePathContext?: FilePathResolutionContext
 }
 
 /** Index of the last visible message item in the turn-grouped timeline. */
@@ -58,36 +71,20 @@ function timelineItemId(it: TimelineItem): string {
   return it.key
 }
 
-/**
- * Returns true for timeline items that arrived after the list's first paint
- * (or after a session switch). History loaded on open does not re-enter.
- */
-function useAnimateEnter(sessionId: SessionId, items: TimelineItem[]): (id: string) => boolean {
-  const sessionRef = useRef(sessionId)
-  const initialIdsRef = useRef<Set<string> | null>(null)
-
-  useEffect(() => {
-    if (sessionRef.current !== sessionId) {
-      sessionRef.current = sessionId
-      initialIdsRef.current = null
-    }
-  }, [sessionId])
-
-  if (initialIdsRef.current === null) {
-    initialIdsRef.current = new Set(items.map(timelineItemId))
-  }
-
-  return (id: string) => !initialIdsRef.current!.has(id)
-}
-
 /** Props shared between the list and its virtualized inner timeline. */
 interface TimelineRenderProps {
   sessionId: SessionId
   groupedItems: TurnTimelineItem[]
   lastMsgIndex: number
-  shouldAnimateEnter: (id: string) => boolean
+  enter: EnterTracker
   onEditMessage?: (text: string) => void
   onRetry?: () => void
+  filePathContext?: FilePathResolutionContext
+  onOpenSubagent: (toolCall: ToolCall) => void
+  parentTurnActive: boolean
+  statusLine: string | null
+  /** Whether the scroller log announces additions (off on the mobile shell). */
+  live: boolean
 }
 
 /**
@@ -99,9 +96,14 @@ function VirtualizedTimeline({
   sessionId,
   groupedItems,
   lastMsgIndex,
-  shouldAnimateEnter,
+  enter,
   onEditMessage,
-  onRetry
+  onRetry,
+  filePathContext,
+  onOpenSubagent,
+  parentTurnActive,
+  statusLine,
+  live
 }: TimelineRenderProps): React.JSX.Element {
   const { viewportEl, pinned } = useMessageScroller()
   const virtualizer = useVirtualizer({
@@ -181,20 +183,44 @@ function VirtualizedTimeline({
           durationMs={item.durationMs}
           attentionRequired={item.attentionRequired}
           hasFinalResponse={item.hasFinalResponse}
-          shouldAnimateEnter={shouldAnimateEnter}
+          enter={enter}
+          statusLine={item.active ? statusLine : null}
+          filePathContext={filePathContext}
+          onOpenSubagent={onOpenSubagent}
         />
       )
     }
     if (item.kind === 'tool') {
+      const id = item.tool.toolCallId
       return (
-        <ToolCallCard
-          toolCall={item.tool}
-          animateEnter={shouldAnimateEnter(item.tool.toolCallId)}
-        />
+        <RowReveal animate={enter.animate(id)} staggerIndex={enter.staggerIndex(id)}>
+          <ToolCallCard
+            toolCall={item.tool}
+            filePathContext={filePathContext}
+            parentTurnActive={parentTurnActive}
+            onOpenSubagent={onOpenSubagent}
+          />
+        </RowReveal>
       )
     }
     if (item.kind === 'thought-group') {
-      return <ThoughtGroup messages={item.messages} isLiveTail={false} />
+      return (
+        <RowReveal animate={enter.animate(item.key)} staggerIndex={enter.staggerIndex(item.key)}>
+          <ThoughtGroup messages={item.messages} isLiveTail={false} />
+        </RowReveal>
+      )
+    }
+    // Worktree-creation progress row — a session-lifetime launch record.
+    if (item.kind === 'worktree') {
+      return (
+        <RowReveal animate={enter.animate(item.key)} staggerIndex={enter.staggerIndex(item.key)}>
+          <WorktreeCreationCard progressId={item.progressId} />
+        </RowReveal>
+      )
+    }
+    // CAP-2 (spec-in-chat-agent-switch): borderless agent-switch separator.
+    if (item.kind === 'switch') {
+      return <AgentSwitchSeparator switch={item.switch} />
     }
     return (
       <ChatMessage
@@ -204,9 +230,10 @@ function VirtualizedTimeline({
         isTurnTail={item.isTurnTail}
         turnText={item.turnText}
         actionsPinned={index === lastMsgIndex}
-        animateEnter={item.isTurnTail ? false : shouldAnimateEnter(item.message.id)}
+        animateEnter={item.isTurnTail ? false : enter.animate(item.message.id)}
         onEdit={onEditMessage}
         onRetry={onRetry}
+        filePathContext={filePathContext}
       />
     )
   }
@@ -218,7 +245,7 @@ function VirtualizedTimeline({
   const virtualItems = virtualizer.getVirtualItems()
   if (viewportEl === null || virtualItems.length === 0) {
     return (
-      <MessageScrollerContent className="mx-auto w-full max-w-3xl">
+      <MessageScrollerContent live={live} className="mx-auto w-full max-w-3xl">
         {groupedItems.map((item, index) => (
           <MessageScrollerItem
             key={item.key}
@@ -234,6 +261,7 @@ function VirtualizedTimeline({
 
   return (
     <MessageScrollerContent
+      live={live}
       className="mx-auto w-full max-w-3xl"
       style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative' }}
     >
@@ -271,43 +299,89 @@ function VirtualizedTimeline({
 export function ChatMessageList({
   items,
   sessionId,
-  agentId,
   showRunningIndicator,
   onEditMessage,
-  onRetry
+  onRetry,
+  filePathContext
 }: ChatMessageListProps): React.JSX.Element {
+  const opencodeNotice = useAcpStore((s) => s.sessions[sessionId]?.opencodeNotice)
+  const statusLine = opencodeStatusLine(opencodeNotice)
+  // The mobile shell announces turn events through its own live region, so the
+  // log stops re-announcing rows as the virtualiser mounts them.
+  const live = !useMobileWebShell()
   const groupedItems = useMemo(
     () => groupTurnActivity(items, showRunningIndicator),
     [items, showRunningIndicator]
   )
-  const lastMsgIndex = useMemo(() => lastMessageIndex(groupedItems), [groupedItems])
-  const shouldAnimateEnter = useAnimateEnter(sessionId, items)
+  // Stabilize item identity across commits: the grouping pipeline mints
+  // fresh wrapper objects every time, which would force every memoized row
+  // to re-render per store flush. Unchanged items reuse their previous
+  // object so memo comparison actually bails.
+  const stableRef = useRef<TurnTimelineItem[]>([])
+  const stableItems = useMemo(() => {
+    stableRef.current = stabilizedTimeline(stableRef.current, groupedItems)
+    return stableRef.current
+  }, [groupedItems])
+  const lastMsgIndex = useMemo(() => lastMessageIndex(stableItems), [stableItems])
+  const itemIds = useMemo(() => items.map(timelineItemId), [items])
+  const enter = useEnterTracker(sessionId, itemIds)
+  const [selection, setSelection] = useState<{ sessionId: SessionId; toolCall: ToolCall } | null>(
+    null
+  )
+  const openSubagent = useCallback(
+    (toolCall: ToolCall) => setSelection({ sessionId, toolCall }),
+    [sessionId]
+  )
+  const selectedItem = items.find(
+    (item) => item.kind === 'tool' && item.tool.toolCallId === selection?.toolCall.toolCallId
+  )
+  const selectedTool =
+    selection?.sessionId === sessionId
+      ? selectedItem?.kind === 'tool'
+        ? selectedItem.tool
+        : selection.toolCall
+      : null
 
   if (items.length === 0 && !showRunningIndicator) {
-    return <ChatEmptyState agentId={agentId} onPick={onEditMessage} />
+    return <ChatEmptyState sessionId={sessionId} />
   }
 
   return (
     <div className="relative min-h-0 flex-1">
       {/* Edge fades: content dissolves into the header/composer instead of hard-cutting. */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-background to-transparent" />
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-6 bg-gradient-to-t from-background to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-terminal-bg to-transparent" />
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-6 bg-gradient-to-t from-terminal-bg to-transparent" />
       <MessageScrollerProvider autoScroll>
-        <ItemCountReporter count={groupedItems.length} />
+        <ItemCountReporter count={stableItems.length} />
         <MessageScroller>
           <MessageScrollerViewport className={cn(CHAT_GUTTER_X, 'py-4')}>
             <VirtualizedTimeline
               sessionId={sessionId}
-              groupedItems={groupedItems}
+              groupedItems={stableItems}
               lastMsgIndex={lastMsgIndex}
-              shouldAnimateEnter={shouldAnimateEnter}
+              enter={enter}
+              filePathContext={filePathContext}
               onEditMessage={onEditMessage}
               onRetry={onRetry}
+              onOpenSubagent={openSubagent}
+              parentTurnActive={showRunningIndicator}
+              statusLine={statusLine}
+              live={live}
             />
           </MessageScrollerViewport>
           <MessageScrollerButton />
         </MessageScroller>
       </MessageScrollerProvider>
+      {selectedTool && (
+        <SubagentDetailsDialog
+          toolCall={selectedTool}
+          parentTurnActive={showRunningIndicator}
+          open
+          onOpenChange={(open) => {
+            if (!open) setSelection(null)
+          }}
+        />
+      )}
     </div>
   )
 }

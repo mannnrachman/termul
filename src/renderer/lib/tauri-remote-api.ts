@@ -6,7 +6,8 @@ import type {
 } from '@shared/types/ipc.types'
 import type { ProjectSummary } from '@shared/types/web-projects.types'
 import type { PersistedSessionSummary } from '@shared/types/web-protocol.types'
-import { type InvokeArgs, invoke } from '@tauri-apps/api/core'
+import type { StoredMcpServer } from './acp-mcp-persistence'
+import { invokeIpc } from './ipc/tauri'
 
 /**
  * Tauri IPC adapter for the desktop-hosted shared-live web server.
@@ -25,22 +26,6 @@ const IPC_COMMANDS = {
   STOP: 'remote_server_stop',
   STATUS: 'remote_server_status'
 } as const
-
-/**
- * Invoke a Tauri command that already returns `IpcResult<T>` from Rust.
- * Wraps only transport-level failures (invoke throwing) into an IpcResult.
- */
-async function invokeIpc<T>(command: string, args?: InvokeArgs): Promise<IpcResult<T>> {
-  try {
-    return await invoke<IpcResult<T>>(command, args)
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : String(error),
-      code: 'INVOKE_ERROR'
-    }
-  }
-}
 
 export const remoteServerApi: RemoteServerApi = {
   /** Start the embedded server on the chosen bind mode (OS-assigned port). */
@@ -61,19 +46,41 @@ export const remoteServerApi: RemoteServerApi = {
 }
 
 /**
- * Push the desktop renderer's current project list into the in-memory
- * `ProjectRegistry` (Epic-4 bridge) so the web/remote client can read it via
- * `GET /projects`. No env-var values cross the wire — `ProjectSummary` redacts
- * by omission. Call on server-start success + on every project-store mutation
- * while the server runs (a no-op when the server is stopped just returns ok).
+ * One-shot import of the desktop renderer's old project list into the host's
+ * durable registry (`project_registry_import`). The host accepts it only while
+ * its registry file says nothing was imported: unknown ids are added, existing
+ * ones are kept, the default applies only when none is set, and a repeat is an
+ * ok no-op (`imported: false`). Either reply is an acknowledgement; the caller
+ * deletes the old `projects` key only after one. No env-var values cross the
+ * wire — `ProjectSummary` redacts by omission.
  */
-export async function syncProjects(
+export async function projectRegistryImport(
   projects: ProjectSummary[],
-  activeProjectId: string | null
-): Promise<IpcResult<void>> {
-  return invokeIpc<void>('remote_sync_projects', {
-    payload: { projects, activeProjectId }
+  defaultProjectId: string | null
+): Promise<IpcResult<{ imported: boolean }>> {
+  return invokeIpc<{ imported: boolean }>('project_registry_import', {
+    payload: { projects, defaultProjectId }
   })
+}
+
+/**
+ * Mirror the desktop app-store MCP registry to the named project's
+ * `.termul/mcp-servers.json` (CAP-7 — registry sync gap). The Rust
+ * `remote_sync_mcp_registry` command resolves `projectId` through the shared
+ * `ProjectRegistry` (an unknown, archived or pathless project is refused
+ * `NOT_FOUND`) and writes the registry via `atomic_file::replace`, so the web
+ * `GET /mcp-servers?projectId=` route (file-based) serves the same registry the
+ * desktop app store holds.
+ *
+ * Best-effort: the result is `IpcResult<void>` (never throws — invoke errors map
+ * to `{ success: false, code: 'INVOKE_ERROR' }`). Callers log a failure but never
+ * let it block the app-store save or the project switch.
+ */
+export async function syncMcpRegistryToProject(
+  projectId: string,
+  registry: StoredMcpServer[]
+): Promise<IpcResult<void>> {
+  return invokeIpc<void>('remote_sync_mcp_registry', { projectId, registry })
 }
 
 /**

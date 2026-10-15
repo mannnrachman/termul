@@ -92,6 +92,51 @@ describe('web-server-api (fetch client)', () => {
         expect(result.error).toContain('500')
       }
     })
+
+    it('preserves a structured failure body on non-2xx (web auth gate 401)', async () => {
+      // The auth gate answers 401 with a valid IpcBody — the adapter must keep
+      // the server's code/message instead of collapsing to NETWORK_ERROR.
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }, 401)
+      )
+
+      const result = await webServerFilesystem.createDirectory('/x')
+
+      expect(result).toEqual({
+        success: false,
+        error: 'Unauthorized',
+        code: 'UNAUTHORIZED'
+      })
+    })
+
+    it('falls back to NETWORK_ERROR when a non-2xx body is not a valid IpcBody', async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse('<html>Bad Gateway</html>', 502))
+
+      const result = await webServerFilesystem.createDirectory('/x')
+
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.code).toBe('NETWORK_ERROR')
+        expect(result.error).toContain('502')
+      }
+    })
+
+    it('falls back to NETWORK_ERROR when a non-2xx body is unparseable', async () => {
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 503,
+        statusText: 'Service Unavailable',
+        json: () => Promise.reject(new Error('unexpected token'))
+      })
+
+      const result = await webServerFilesystem.createDirectory('/x')
+
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.code).toBe('NETWORK_ERROR')
+        expect(result.error).toContain('503')
+      }
+    })
   })
 
   describe('webServerFilesystem.createFile', () => {
@@ -193,6 +238,31 @@ describe('web-server-api (fetch client)', () => {
       mockFetch.mockRejectedValueOnce(new Error('offline'))
 
       await expect(webServerGit.init('/proj')).rejects.toThrow('offline')
+    })
+  })
+
+  describe('webServerGit.getDiffStat', () => {
+    it('POSTs /git/diff-stat with { cwd } and returns the unwrapped stat', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ success: true, data: { added: 3, removed: 1 } })
+      )
+
+      await expect(webServerGit.getDiffStat('/proj')).resolves.toEqual({ added: 3, removed: 1 })
+      expect(mockFetch).toHaveBeenCalledWith(
+        `${window.location.origin}/git/diff-stat`,
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({ cwd: '/proj' })
+        })
+      )
+    })
+
+    it('throws the host error message on OUTSIDE_PROJECT_ROOT', async () => {
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ success: false, error: 'outside root', code: 'OUTSIDE_PROJECT_ROOT' })
+      )
+
+      await expect(webServerGit.getDiffStat('/elsewhere')).rejects.toThrow('outside root')
     })
   })
 

@@ -10,7 +10,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const {
   mockSetTerminals,
   mockSelectTerminal,
-  mockIsTerminalLimitReached,
   mockAddTabToPane,
   mockTerminalApiSpawn,
   mockEnsureWorktreeSymlinks,
@@ -18,7 +17,6 @@ const {
 } = vi.hoisted(() => ({
   mockSetTerminals: vi.fn(),
   mockSelectTerminal: vi.fn(),
-  mockIsTerminalLimitReached: vi.fn(),
   mockAddTabToPane: vi.fn(),
   mockTerminalApiSpawn: vi.fn(),
   mockEnsureWorktreeSymlinks: vi.fn(),
@@ -30,8 +28,7 @@ vi.mock('@/stores/terminal-store', () => ({
     getState: () => ({
       terminals: mockTerminals,
       setTerminals: mockSetTerminals,
-      selectTerminal: mockSelectTerminal,
-      isTerminalLimitReached: mockIsTerminalLimitReached
+      selectTerminal: mockSelectTerminal
     })
   }
 }))
@@ -53,12 +50,6 @@ vi.mock('@/stores/project-store', () => ({
   }
 }))
 
-vi.mock('@/stores/app-settings-store', () => ({
-  useAppSettingsStore: {
-    getState: () => ({ settings: { maxTerminalsPerProject: 10 } })
-  }
-}))
-
 vi.mock('@/lib/api', () => ({
   terminalApi: { spawn: mockTerminalApiSpawn }
 }))
@@ -73,6 +64,7 @@ vi.mock('@/lib/worktree-context', () => ({
 
 import { launchAgentInPane } from '@/lib/agent-launch'
 import { getBuiltInAgent } from '@/lib/agents/agent-registry'
+import { mockSpawnedTerminal } from '@/lib/test-utils/terminal'
 
 const claude = getBuiltInAgent('claude-code')!
 const gemini = getBuiltInAgent('gemini-cli')!
@@ -86,10 +78,11 @@ describe('launchAgentInPane', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockTerminals.length = 0
-    mockIsTerminalLimitReached.mockReturnValue(false)
+    // CAP-3: spawn is the only claim issuance path — the fixture carries the
+    // issued lease credential alongside the terminal info.
     mockTerminalApiSpawn.mockResolvedValue({
       success: true,
-      data: { id: 'pty-1', shell: 'claude', cwd: '/test' }
+      data: mockSpawnedTerminal({ shell: 'claude', claim: 'claim-agent-1' })
     })
   })
 
@@ -98,6 +91,7 @@ describe('launchAgentInPane', () => {
     expect(result.success).toBe(true)
     expect(mockTerminalApiSpawn).toHaveBeenCalledWith(
       expect.objectContaining({
+        projectId: 'proj-1',
         cwd: '/test',
         program: 'claude',
         args: ['explain this'],
@@ -109,7 +103,12 @@ describe('launchAgentInPane', () => {
   it('uses the flag form for gemini', async () => {
     await launchAgentInPane('pane-1', 'proj-1', '/test', gemini, 'query')
     expect(mockTerminalApiSpawn).toHaveBeenCalledWith(
-      expect.objectContaining({ program: 'gemini', args: ['-i', 'query'], kind: 'agent' })
+      expect.objectContaining({
+        projectId: 'proj-1',
+        program: 'gemini',
+        args: ['-i', 'query'],
+        kind: 'agent'
+      })
     )
   })
 
@@ -134,6 +133,29 @@ describe('launchAgentInPane', () => {
     expect(JSON.stringify(lastCreatedTerminal())).not.toContain('do a thing')
   })
 
+  it('captures the issued claim on the created terminal record', async () => {
+    const result = await launchAgentInPane('pane-1', 'proj-1', '/test', claude, 'x')
+
+    expect(result.success).toBe(true)
+    // CAP-3: the lease credential lands in the batched set() record alongside
+    // the ptyId — no spawn path may produce a lease-less terminal record.
+    expect(lastCreatedTerminal()).toMatchObject({
+      ptyId: 'pty-1',
+      claim: 'claim-agent-1'
+    })
+  })
+
+  it('omits the claim key when the spawn response carries none', async () => {
+    mockTerminalApiSpawn.mockResolvedValue({
+      success: true,
+      data: { id: 'pty-2', shell: 'claude', cwd: '/test' }
+    })
+
+    await launchAgentInPane('pane-1', 'proj-1', '/test', claude, 'x')
+
+    expect(lastCreatedTerminal()).not.toHaveProperty('claim')
+  })
+
   it('names the terminal after the agent, selects it, and adds a tab', async () => {
     const result = await launchAgentInPane('pane-1', 'proj-1', '/test', claude, 'x')
     expect(result.terminalId).toBeTruthy()
@@ -154,17 +176,28 @@ describe('launchAgentInPane', () => {
     const pi = getBuiltInAgent('pi')!
     await launchAgentInPane('pane-1', 'proj-1', '/test', pi, 'ignored prompt')
     expect(mockTerminalApiSpawn).toHaveBeenCalledWith(
-      expect.objectContaining({ program: 'pi', args: ['ignored prompt'], kind: 'agent' })
+      expect.objectContaining({
+        projectId: 'proj-1',
+        program: 'pi',
+        args: ['ignored prompt'],
+        kind: 'agent'
+      })
     )
   })
 
-  it('blocks when the per-project terminal limit is reached', async () => {
+  it('shows the host terminal_limit refusal and records nothing', async () => {
+    const hostMessage =
+      'Terminal limit reached (10 per project, 30 total): this project is at its limit'
     mockTerminals.push({ projectId: 'proj-1' }, { projectId: 'proj-1' })
-    const result = await launchAgentInPane('pane-1', 'proj-1', '/test', claude, 'x', {
-      maxTerminalsPerProject: 2
+    mockTerminalApiSpawn.mockResolvedValue({
+      success: false,
+      error: hostMessage,
+      code: 'TERMINAL_LIMIT'
     })
-    expect(result.success).toBe(false)
-    expect(mockTerminalApiSpawn).not.toHaveBeenCalled()
+    const result = await launchAgentInPane('pane-1', 'proj-1', '/test', claude, 'x')
+    expect(result).toEqual({ success: false, error: hostMessage })
+    expect(mockSetTerminals).not.toHaveBeenCalled()
+    expect(mockAddTabToPane).not.toHaveBeenCalled()
   })
 
   it('surfaces a spawn failure as a result error', async () => {

@@ -12,9 +12,12 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::{
-    ClientCapabilities, FileSystemCapabilities, Meta, ReadTextFileRequest, ReadTextFileResponse,
-    SessionNotification, SessionUpdate, WriteTextFileRequest, WriteTextFileResponse,
+use agent_client_protocol::schema::v1::{
+    AuthCapabilities, BooleanConfigOptionCapabilities, ClientCapabilities,
+    ClientSessionCapabilities, ElicitationCapabilities, ElicitationFormCapabilities,
+    ElicitationUrlCapabilities, FileSystemCapabilities, Meta, ReadTextFileRequest,
+    ReadTextFileResponse, SessionConfigOptionsCapabilities, SessionNotification, SessionUpdate,
+    WriteTextFileRequest, WriteTextFileResponse,
 };
 
 use crate::acp::config::AgentId;
@@ -33,6 +36,10 @@ use crate::web::EventSink;
 /// hook. Unknown agents ignore unrecognized `_meta` keys.
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 
+/// Codex (and other non-AIR clients) stream command output on this `_meta`
+/// key. Advertising it keeps the chunk channel stable.
+const TERMINAL_OUTPUT_DELTA_META_KEY: &str = "terminal_output_delta";
+
 /// Build the client capabilities advertised to the agent during `initialize`.
 ///
 /// We always advertise `fs.readTextFile` and `fs.writeTextFile`. The `terminal`
@@ -45,15 +52,33 @@ const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 /// `configOptions`. Harmless for agents that ignore unknown `_meta` keys.
 #[must_use]
 pub fn client_capabilities(allow_terminal: bool) -> ClientCapabilities {
-    let meta = Meta::from_iter([(
-        PARAMETERIZED_MODEL_PICKER_META_KEY.into(),
-        serde_json::Value::Bool(true),
-    )]);
+    let meta = Meta::from_iter([
+        (
+            PARAMETERIZED_MODEL_PICKER_META_KEY.into(),
+            serde_json::Value::Bool(true),
+        ),
+        (
+            TERMINAL_OUTPUT_DELTA_META_KEY.into(),
+            serde_json::Value::Bool(true),
+        ),
+    ]);
     ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
             .read_text_file(true)
             .write_text_file(true))
         .terminal(allow_terminal)
+        // `unstable_auth_methods` (spec-acp-terminal-auth): advertise terminal
+        // auth support so agents like devin expose their designed headless
+        // path (`devin-terminal-login`) instead of only browser methods.
+        .auth(AuthCapabilities::new().terminal(true))
+        .session(ClientSessionCapabilities::new().config_options(
+            SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new()),
+        ))
+        .elicitation(
+            ElicitationCapabilities::new()
+                .form(ElicitationFormCapabilities::new())
+                .url(ElicitationUrlCapabilities::new()),
+        )
         .meta(meta)
 }
 
@@ -68,10 +93,7 @@ pub fn client_capabilities(allow_terminal: bool) -> ClientCapabilities {
 /// `None` the absolute path is resolved directly (no longer denied). `root`
 /// remains in the signature as the session `cwd` for future relative-path
 /// resolution; it is not used for containment.
-async fn scope_to_workspace(
-    requested: &Path,
-    _root: Option<&Path>,
-) -> Result<PathBuf, acp::Error> {
+async fn scope_to_workspace(requested: &Path, _root: Option<&Path>) -> Result<PathBuf, acp::Error> {
     if !requested.is_absolute() {
         return Err(acp::Error::invalid_params()
             .data(format!("path must be absolute: {}", requested.display())));
@@ -103,10 +125,8 @@ async fn scope_to_workspace(
             Err(_) => match ancestor.parent() {
                 Some(parent) if parent != ancestor => ancestor = parent,
                 _ => {
-                    return Err(acp::Error::invalid_params().data(format!(
-                        "path cannot be resolved: {}",
-                        requested.display()
-                    )));
+                    return Err(acp::Error::invalid_params()
+                        .data(format!("path cannot be resolved: {}", requested.display())));
                 }
             },
         }
@@ -179,6 +199,10 @@ pub async fn handle_write_text_file(
     Ok(WriteTextFileResponse::new())
 }
 
+fn chunk_message_id(chunk: &agent_client_protocol::schema::v1::ContentChunk) -> Option<String> {
+    chunk.message_id.as_ref().map(|id| id.0.to_string())
+}
+
 /// Translate an inbound `session/update` notification into the matching
 /// `acp:*` event and fan it out through the dispatcher's sinks.
 ///
@@ -198,17 +222,24 @@ pub fn emit_session_update(
 
     match notification.update {
         SessionUpdate::UserMessageChunk(chunk) => {
+            let message_id = chunk_message_id(&chunk);
             let event = MessageChunkEvent {
                 agent_id: agent_id.clone(),
                 session_id,
                 role: ChunkRole::User,
                 content: chunk.content,
+                message_id,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_MESSAGE_CHUNK, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_MESSAGE_CHUNK,
+                &event,
+            );
         }
         SessionUpdate::AgentMessageChunk(chunk) => {
             let preview = match &chunk.content {
-                agent_client_protocol::schema::ContentBlock::Text(text) => {
+                agent_client_protocol::schema::v1::ContentBlock::Text(text) => {
                     let t: &str = text.text.as_ref();
                     if t.chars().count() > 40 {
                         let truncated: String = t.chars().take(40).collect();
@@ -221,24 +252,38 @@ pub fn emit_session_update(
             };
             log::debug!(
                 "[acp] agent {agent_id} session {} agent_message_chunk: {preview}",
-                session_id.0
+                crate::logging::redact_session_id(&session_id.0)
             );
+            let message_id = chunk_message_id(&chunk);
             let event = MessageChunkEvent {
                 agent_id: agent_id.clone(),
                 session_id,
                 role: ChunkRole::Agent,
                 content: chunk.content,
+                message_id,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_MESSAGE_CHUNK, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_MESSAGE_CHUNK,
+                &event,
+            );
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
+            let message_id = chunk_message_id(&chunk);
             let event = MessageChunkEvent {
                 agent_id: agent_id.clone(),
                 session_id,
                 role: ChunkRole::Thought,
                 content: chunk.content,
+                message_id,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_MESSAGE_CHUNK, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_MESSAGE_CHUNK,
+                &event,
+            );
         }
         SessionUpdate::ToolCall(tool_call) => {
             let event = ToolCallEvent {
@@ -246,7 +291,12 @@ pub fn emit_session_update(
                 session_id,
                 tool_call,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_TOOL_CALL, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_TOOL_CALL,
+                &event,
+            );
         }
         SessionUpdate::ToolCallUpdate(update) => {
             let event = ToolCallUpdateEvent {
@@ -254,7 +304,12 @@ pub fn emit_session_update(
                 session_id,
                 update,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_TOOL_CALL_UPDATE, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_TOOL_CALL_UPDATE,
+                &event,
+            );
         }
         SessionUpdate::Plan(plan) => {
             // ACP agent-plan: each update is a full replace; forward verbatim.
@@ -264,7 +319,12 @@ pub fn emit_session_update(
                 session_id,
                 plan,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_PLAN_UPDATE, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_PLAN_UPDATE,
+                &event,
+            );
         }
         SessionUpdate::AvailableCommandsUpdate(update) => {
             let event = CommandsUpdateEvent {
@@ -272,7 +332,12 @@ pub fn emit_session_update(
                 session_id,
                 available_commands: update.available_commands,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_COMMANDS_UPDATE, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_COMMANDS_UPDATE,
+                &event,
+            );
         }
         SessionUpdate::CurrentModeUpdate(update) => {
             let event = ModeUpdateEvent {
@@ -281,7 +346,12 @@ pub fn emit_session_update(
                 current_mode_id: update.current_mode_id,
                 available_modes: Vec::new(),
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_MODE_UPDATE, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_MODE_UPDATE,
+                &event,
+            );
         }
         SessionUpdate::ConfigOptionUpdate(update) => {
             let event = ConfigOptionsUpdateEvent {
@@ -289,29 +359,37 @@ pub fn emit_session_update(
                 session_id,
                 config_options: update.config_options,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_CONFIG_OPTIONS_UPDATE, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_CONFIG_OPTIONS_UPDATE,
+                &event,
+            );
         }
         SessionUpdate::SessionInfoUpdate(update) => {
-            // `title` is `MaybeUndefined<String>`: Undefined = not sent (skip),
-            // Null = explicitly cleared (emit None), Value = set (emit Some).
-            match update.title.as_opt_ref() {
-                None => {} // Undefined — no title field sent, skip
-                Some(None) => {
-                    let event = SessionInfoUpdateEvent {
-                        agent_id: agent_id.clone(),
-                        session_id,
-                        title: None,
-                    };
-                    events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_SESSION_INFO_UPDATE, &event);
-                }
-                Some(Some(t)) => {
-                    let event = SessionInfoUpdateEvent {
-                        agent_id: agent_id.clone(),
-                        session_id,
-                        title: Some(t.clone()),
-                    };
-                    events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_SESSION_INFO_UPDATE, &event);
-                }
+            // `title` is `MaybeUndefined<String>`: Undefined = omit the field,
+            // Null = explicitly cleared, Value = set. OpenCode 2 compaction
+            // and retry markers arrive on `_meta` with no title.
+            let title = match update.title.as_opt_ref() {
+                None => None,
+                Some(None) => Some(None),
+                Some(Some(title)) => Some(Some(title.clone())),
+            };
+            let notices = events::opencode_notices(update.meta.as_ref());
+            if title.is_some() || notices.compaction.is_some() || notices.retry.is_some() {
+                let event = SessionInfoUpdateEvent {
+                    agent_id: agent_id.clone(),
+                    session_id,
+                    title,
+                    compaction: notices.compaction,
+                    retry: notices.retry,
+                };
+                events::fan_out(
+                    sinks,
+                    Some(event.session_id.0.as_str()),
+                    events::EVENT_SESSION_INFO_UPDATE,
+                    &event,
+                );
             }
         }
         SessionUpdate::UsageUpdate(update) => {
@@ -319,14 +397,22 @@ pub fn emit_session_update(
                 amount: c.amount,
                 currency: c.currency,
             });
+            let rate_limit =
+                crate::acp::claude_accounts::usage::claude_rate_limit(update.meta.as_ref());
             let event = UsageUpdateEvent {
                 agent_id: agent_id.clone(),
                 session_id,
                 used: update.used,
                 size: update.size,
                 cost,
+                rate_limit,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_USAGE_UPDATE, &event);
+            events::fan_out(
+                sinks,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_USAGE_UPDATE,
+                &event,
+            );
         }
         // Any future (non_exhaustive) variants have no dedicated event;
         // ignore them — but log so a silently-dropped update can be diagnosed
@@ -340,174 +426,4 @@ pub fn emit_session_update(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn client_capabilities_advertise_fs_and_gate_terminal() {
-        let caps = client_capabilities(true);
-        assert!(caps.fs.read_text_file);
-        assert!(caps.fs.write_text_file);
-        assert!(caps.terminal);
-        // Default-deny: terminal is omitted unless the agent opted in.
-        let denied = client_capabilities(false);
-        assert!(denied.fs.read_text_file);
-        assert!(!denied.terminal);
-    }
-
-    #[test]
-    fn client_capabilities_advertise_parameterized_model_picker_meta() {
-        let caps = client_capabilities(false);
-        let meta = caps.meta.expect("expected client capabilities _meta");
-        assert_eq!(
-            meta.get(PARAMETERIZED_MODEL_PICKER_META_KEY),
-            Some(&serde_json::Value::Bool(true))
-        );
-    }
-
-    #[tokio::test]
-    async fn read_text_file_rejects_relative_path() {
-        let req = ReadTextFileRequest::new("sess", "relative/path.txt");
-        let root = std::env::temp_dir();
-        let err = handle_read_text_file(&req, Some(root.as_path()))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, acp::ErrorCode::InvalidParams);
-    }
-
-    #[tokio::test]
-    async fn read_without_workspace_root_succeeds() {
-        // An absolute path with no associated session root is now resolved
-        // directly (no longer denied — the containment jail was removed by
-        // spec-remove-web-fs-path-jail).
-        let dir = std::env::temp_dir().join(format!("acp-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("file.txt");
-        std::fs::write(&path, "secret").unwrap();
-
-        let req = ReadTextFileRequest::new("sess", &path);
-        let resp = handle_read_text_file(&req, None).await.unwrap();
-        assert_eq!(resp.content, "secret");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn read_outside_workspace_is_allowed() {
-        // A direct absolute path outside the workspace root is now allowed
-        // (the containment jail was removed by spec-remove-web-fs-path-jail).
-        let base = std::env::temp_dir().join(format!("acp-test-{}", uuid::Uuid::new_v4()));
-        let workspace = base.join("workspace");
-        let outside = base.join("outside");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let secret = outside.join("secret.txt");
-        std::fs::write(&secret, "top secret").unwrap();
-
-        let req = ReadTextFileRequest::new("sess", &secret);
-        let resp = handle_read_text_file(&req, Some(workspace.as_path()))
-            .await
-            .unwrap();
-        assert_eq!(resp.content, "top secret");
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[tokio::test]
-    async fn read_rejects_traversal_sequence_in_path() {
-        // `..` traversal is still rejected even though containment is removed.
-        let base = std::env::temp_dir().join(format!("acp-test-{}", uuid::Uuid::new_v4()));
-        let workspace = base.join("workspace");
-        let outside = base.join("outside");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let secret = outside.join("secret.txt");
-        std::fs::write(&secret, "top secret").unwrap();
-
-        let escape = workspace.join("..").join("outside").join("secret.txt");
-        let req = ReadTextFileRequest::new("sess", &escape);
-        let err = handle_read_text_file(&req, Some(workspace.as_path()))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, acp::ErrorCode::InvalidParams);
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[tokio::test]
-    async fn write_outside_workspace_is_allowed() {
-        // A write to a path outside the workspace root is now allowed (the
-        // containment jail was removed by spec-remove-web-fs-path-jail).
-        let base = std::env::temp_dir().join(format!("acp-test-{}", uuid::Uuid::new_v4()));
-        let workspace = base.join("workspace");
-        let outside = base.join("outside");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-
-        let target = outside.join("evil.txt");
-        let req = WriteTextFileRequest::new("sess", &target, "pwned");
-        handle_write_text_file(&req, Some(workspace.as_path()))
-            .await
-            .unwrap();
-        assert!(target.exists(), "write outside workspace must succeed");
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "pwned");
-
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[tokio::test]
-    async fn write_then_read_roundtrips() {
-        let workspace = std::env::temp_dir().join(format!("acp-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&workspace).unwrap();
-        let path = workspace.join("nested").join("file.txt");
-
-        let write_req = WriteTextFileRequest::new("sess", &path, "line1\nline2\nline3");
-        handle_write_text_file(&write_req, Some(workspace.as_path()))
-            .await
-            .unwrap();
-
-        let read_req = ReadTextFileRequest::new("sess", &path);
-        let resp = handle_read_text_file(&read_req, Some(workspace.as_path()))
-            .await
-            .unwrap();
-        assert_eq!(resp.content, "line1\nline2\nline3");
-
-        // line/limit slicing: start at line 2, take 1 line.
-        let sliced = ReadTextFileRequest::new("sess", &path)
-            .line(2u32)
-            .limit(1u32);
-        let resp = handle_read_text_file(&sliced, Some(workspace.as_path()))
-            .await
-            .unwrap();
-        // Slicing preserves the original terminator on the sliced line.
-        assert_eq!(resp.content, "line2\n");
-
-        let _ = std::fs::remove_dir_all(&workspace);
-    }
-
-    #[tokio::test]
-    async fn slicing_preserves_crlf_and_trailing_newline() {
-        let workspace = std::env::temp_dir().join(format!("acp-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&workspace).unwrap();
-        let path = workspace.join("crlf.txt");
-
-        // CRLF file ending in a trailing newline.
-        std::fs::write(&path, "a\r\nb\r\nc\r\n").unwrap();
-
-        // Take all three lines starting at line 1: must be byte-identical.
-        let req = ReadTextFileRequest::new("sess", &path).line(1u32).limit(3u32);
-        let resp = handle_read_text_file(&req, Some(workspace.as_path()))
-            .await
-            .unwrap();
-        assert_eq!(resp.content, "a\r\nb\r\nc\r\n");
-
-        // Take the middle line: keep its CRLF terminator.
-        let req = ReadTextFileRequest::new("sess", &path).line(2u32).limit(1u32);
-        let resp = handle_read_text_file(&req, Some(workspace.as_path()))
-            .await
-            .unwrap();
-        assert_eq!(resp.content, "b\r\n");
-
-        let _ = std::fs::remove_dir_all(&workspace);
-    }
-}
+mod tests;

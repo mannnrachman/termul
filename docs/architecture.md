@@ -75,7 +75,7 @@ This preserves a browser/dev/test path while keeping the Tauri-specific app as t
 Core shell files:
 
 - `WorkspaceLayout.tsx`
-- `TitleBar.tsx`
+- `components/shell/ShellFrame.tsx` (Rail, Side panel and main area)
 - `StatusBar.tsx`
 - route pages such as `ProjectSettings.tsx`, `AppPreferences.tsx`, and `WorkspaceSnapshots.tsx`
 
@@ -130,7 +130,7 @@ This is a strongly store-driven architecture with hooks providing side-effect or
 
 Hooks such as:
 
-- `use-projects-persistence`
+- `use-project-registry`
 - `use-terminal-restore`
 - `useTerminalAutoSave`
 - `use-file-watcher`
@@ -192,9 +192,8 @@ Responsibilities:
 - process spawn/kill/resize/write
 - terminal lifecycle tracking
 - Windows-specific ConPTY handling
-- renderer attachment bookkeeping
 - transcript / output event streaming
-- orphan detection policies
+- exited-terminal expiry (a live terminal ends only by kill, exit or shutdown)
 
 ### 4. Tracker Subsystem
 
@@ -226,7 +225,13 @@ This is one of the most custom parts of the app architecture.
 
 ### Renderer-Side Persistence
 
-The renderer uses Tauri plugin-store adapters through versioned persistence APIs.
+The renderer keeps settings and lightweight application data in the host store
+through one versioned persistence facade on every surface: browsers and phones
+reach it over a WebSocket, the desktop over its Tauri channel connection to the
+host store it runs in-process. Keys are scoped per device or shared (see
+`docs/api-contracts.md`). Desktop ACP chat transcripts are an exception: they
+are owned by a Rust file store under Tauri app data, with a lightweight index
+and one atomic JSON payload per session.
 
 Primary persisted domains include:
 
@@ -236,13 +241,14 @@ Primary persisted domains include:
 - command history
 - window state
 - app settings
-- session persistence
+- Rust-backed desktop ACP chat history
+- standalone ACP event-log session persistence
 
 ### Shared Persistence Contracts
 
 `src/shared/types/persistence.types.ts` defines structures like:
 
-- `PersistedProjectData`
+- `ProjectPrefsRecord` (per-device project settings and sidebar layout; the project list itself lives in the host registry)
 - `PersistedTerminalLayout`
 - `PersistedSnapshotList`
 - `WindowState`
@@ -251,8 +257,12 @@ Primary persisted domains include:
 
 - debounced writes with flush-on-close behavior
 - version-wrapped persisted records
+- atomic Rust replacement for desktop ACP payload/index files
+- bounded renderer LRU for inactive full chat payloads; trimmed live sessions stay pinned
+- verified, fail-closed legacy ACP import from the retired `termul-data.json` (now itself imported once into the host store)
+- desktop shared-live browser history reads durable files on demand instead of renderer clones
 - transcript/scrollback persistence for restore scenarios
-- session store separated from general app data store
+- session stores separated from general app data store
 
 ## State Management Patterns
 
@@ -331,6 +341,14 @@ CI runs:
 - store-driven composition with reusable hooks
 - good CI discipline across JS and Rust stacks
 - significant test surface in renderer code
+
+## Web Terminal Transport
+
+The renderer terminal seam is `terminal-api.ts`: Tauri uses typed commands and browser builds use a dedicated `/terminal/ws` socket. The terminal socket is intentionally separate from ACP `/ws`; it carries PTY requests, bounded scrollback replay/live output, and transport-neutral lifecycle/cwd/git/exit events. `ConnectedTerminal` remains the single xterm surface in both runtimes.
+
+Standalone `termul-server` owns its `PtyManager` and terminates those PTYs after graceful shutdown. Desktop shared-live mode passes the already-managed desktop `Arc<PtyManager>` into Axum, so stopping sharing detaches browser clients without killing desktop terminals. Output broadcast queues and replay scrollback remain bounded.
+
+**Security boundary:** terminal authentication, authorization, TLS, and sandbox hardening are deferred. `/terminal/ws` must not be exposed to public or untrusted networks; existing server exposure controls are the only boundary in this version. Logs record lifecycle/request outcomes only and must never record terminal input, output, environment values, or secrets.
 
 ## Architectural Risks / Constraints
 

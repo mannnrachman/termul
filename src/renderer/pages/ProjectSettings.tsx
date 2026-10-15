@@ -1,7 +1,11 @@
 import type { DetectedShells } from '@shared/types/ipc.types'
+import { Fragment, useEffect, useRef, useState } from 'react'
+import { toast } from 'sonner'
+import { ConfirmDialog } from '@/components/ConfirmDialog'
 import {
   ChevronDown,
   Info,
+  KeyRound,
   KeySquare,
   Link2,
   Plus,
@@ -12,28 +16,34 @@ import {
   TerminalSquare,
   Upload,
   X
-} from 'lucide-react'
-import { Fragment, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { ConfirmDialog } from '@/components/ConfirmDialog'
+} from '@/components/icons'
 import { NewProjectModal } from '@/components/NewProjectModal'
+import { ProjectProviderSettings } from '@/components/settings/provider/ProjectProviderSettings'
 import {
   type SettingsCategory,
   SettingsLayout,
   SettingsSection
 } from '@/components/settings/SettingsLayout'
+import { SettingsModal } from '@/components/settings/SettingsModal'
+import { Button } from '@/components/ui/button'
+import { FOCUS_RING_CLASS, PANEL_FIELD_CLASS } from '@/components/ui/panel-styles'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Spinner } from '@/components/ui/spinner'
+import { Switch } from '@/components/ui/switch'
+import { useProjectClaudeAccountDraft } from '@/hooks/use-project-claude-account-draft'
 import { dialogApi, filesystemApi, shellApi, worktreeApi } from '@/lib/api'
 import { availableColors, getColorClasses } from '@/lib/colors'
 import { mergeEnvVars, parseEnvFile, resolveProjectEnvPath } from '@/lib/env-parser'
 import type { SettingsSearchEntry } from '@/lib/settings-search'
 import { cn } from '@/lib/utils'
+import { applyProjectClaudeAccount } from '@/stores/claude-account-switch'
 import {
   useActiveProject,
   useActiveProjectId,
   useProjectActions,
   useProjectStore
 } from '@/stores/project-store'
+import { useSettingsModalStore } from '@/stores/settings-modal-store'
 import type { EnvVariable, ProjectColor } from '@/types/project'
 
 const PROJECT_SETTINGS_CATEGORIES: SettingsCategory[] = [
@@ -41,10 +51,17 @@ const PROJECT_SETTINGS_CATEGORIES: SettingsCategory[] = [
   { id: 'env-vars', label: 'Environment Variables', icon: <KeySquare size={16} /> },
   { id: 'shell', label: 'Shell Settings', icon: <TerminalSquare size={16} /> },
   { id: 'symlinks', label: 'Worktree Symlinks', icon: <Link2 size={16} /> },
+  { id: 'provider', label: 'Provider', icon: <KeyRound size={16} /> },
   { id: 'emergency', label: 'Emergency Mode', icon: <ShieldAlert size={16} /> }
 ]
 
 const PROJECT_SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
+  {
+    categoryId: 'provider',
+    label: 'Claude account',
+    description: 'Choose the Claude account that chats in this project use.',
+    keywords: ['provider', 'account', 'claude', 'work', 'personal', 'switch']
+  },
   {
     categoryId: 'general',
     label: 'Project Name',
@@ -107,11 +124,14 @@ const PROJECT_SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   }
 ]
 
-export default function ProjectSettings() {
-  const navigate = useNavigate()
+export function ProjectSettingsModal() {
+  const isOpen = useSettingsModalStore((state) => state.view === 'project')
+  const close = useSettingsModalStore((state) => state.close)
+  const openAppSettings = useSettingsModalStore((state) => state.openApp)
   const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false)
   const [isCloseConfirmOpen, setIsCloseConfirmOpen] = useState(false)
   const activeProject = useActiveProject()
+  const claudeAccountDraft = useProjectClaudeAccountDraft(activeProject?.id, { enabled: isOpen })
   const activeProjectId = useActiveProjectId()
   const { addProject, updateProject } = useProjectActions()
 
@@ -248,6 +268,17 @@ export default function ProjectSettings() {
         defaultShell: shell,
         symlinkDirs: normalizedSymlinkDirs
       })
+      const projectId = activeProject.id
+      void claudeAccountDraft
+        .save()
+        .then((changed) => {
+          if (changed) void applyProjectClaudeAccount(projectId)
+        })
+        .catch((err) => {
+          toast.error(
+            `Could not save the Claude account: ${err instanceof Error ? err.message : String(err)}`
+          )
+        })
       setEnvVars(normalizedEnvVars)
       setSymlinkDirs(normalizedSymlinkDirs)
       setHasChanges(false)
@@ -382,58 +413,64 @@ export default function ProjectSettings() {
     }
   }
 
+  const handleClose = () => {
+    if (hasChanges) {
+      setIsCloseConfirmOpen(true)
+    } else {
+      close()
+    }
+  }
+
   return (
     <>
-      <main className="flex-1 flex flex-col min-w-0 h-full relative">
-        {/* Header */}
-        <div className="h-16 flex items-center justify-between px-8 border-b border-border bg-card flex-shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-primary/10 rounded text-primary">
-              <Settings size={20} />
+      <SettingsModal
+        isOpen={isOpen}
+        onClose={handleClose}
+        title="Project Settings"
+        subtitle={activeProject?.name ? `Configuration for ${activeProject.name}` : undefined}
+        icon={<Settings size={20} />}
+        footer={
+          hasChanges ? (
+            <div className="p-4 flex justify-end items-center gap-4 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
+              <span className="text-sm text-muted-foreground mr-auto flex items-center">
+                <Info size={14} className="mr-2 text-warning" />
+                <span className="opacity-80">You have unsaved changes</span>
+              </span>
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  claudeAccountDraft.reset()
+                  setHasChanges(false)
+                }}
+              >
+                Discard
+              </Button>
+              <Button type="button" size="sm" onClick={handleSave}>
+                <Save />
+                Save Changes
+              </Button>
             </div>
-            <div>
-              <h1 className="text-xl font-semibold text-foreground leading-tight">
-                Project Settings
-              </h1>
-              <p className="text-xs text-muted-foreground">
-                Configuration for{' '}
-                <span className="font-semibold text-secondary-foreground">
-                  {activeProject?.name}
-                </span>
-              </p>
-            </div>
-          </div>
-          <button
-            onClick={() => {
-              if (hasChanges) {
-                setIsCloseConfirmOpen(true)
-              } else {
-                navigate('/')
-              }
-            }}
-            className="group flex items-center justify-center h-8 w-8 rounded-md hover:bg-secondary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-            title="Close"
-            aria-label="Close project settings"
-          >
-            <X size={18} className="text-muted-foreground group-hover:text-foreground" />
-          </button>
-        </div>
-
+          ) : undefined
+        }
+      >
         {/* Content */}
         <SettingsLayout
+          title="Project settings"
           categories={PROJECT_SETTINGS_CATEGORIES}
           searchIndex={PROJECT_SETTINGS_SEARCH_INDEX}
         >
           {/* General Section */}
           <SettingsSection id="general">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
-              <div className="w-1/3 pt-1">
+            <div className="flex flex-col items-start gap-6 border-b border-border pb-6 md:flex-row">
+              <div className="w-full pt-1 md:w-1/3">
                 <h2 className="text-lg font-medium text-foreground">General</h2>
                 <p className="text-sm text-muted-foreground mt-1">
                   Basic project identification and location.
                 </p>
               </div>
-              <div className="w-2/3 space-y-4">
+              <div className="w-full space-y-4 md:w-full md:w-2/3">
                 <div>
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     Project Name
@@ -445,7 +482,7 @@ export default function ProjectSettings() {
                       setProjectName(e.target.value)
                       setHasChanges(true)
                     }}
-                    className="w-full bg-secondary/50 border border-border rounded-md px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className={cn(PANEL_FIELD_CLASS, 'w-full rounded-md px-3 py-2 text-sm')}
                   />
                 </div>
 
@@ -461,7 +498,10 @@ export default function ProjectSettings() {
                         setRootPath(e.target.value)
                         setHasChanges(true)
                       }}
-                      className="flex-1 bg-secondary/50 border border-border rounded-md px-3 py-2 text-sm text-foreground font-mono focus:ring-2 focus:ring-primary outline-none"
+                      className={cn(
+                        PANEL_FIELD_CLASS,
+                        'flex-1 rounded-md px-3 py-2 font-mono text-sm'
+                      )}
                     />
                     <button
                       onClick={async () => {
@@ -513,8 +553,8 @@ export default function ProjectSettings() {
 
           {/* Environment Variables Section */}
           <SettingsSection id="env-vars">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
-              <div className="w-1/3 pt-1">
+            <div className="flex flex-col items-start gap-6 border-b border-border pb-6 md:flex-row">
+              <div className="w-full pt-1 md:w-1/3">
                 <h2 className="text-lg font-medium text-foreground">Environment Variables</h2>
                 <p className="text-sm text-muted-foreground mt-1">
                   Secrets and config injected into your shell session. Secret values are cleared on
@@ -534,12 +574,10 @@ export default function ProjectSettings() {
                 </button>
                 {importError && <p className="mt-2 text-xs text-destructive">{importError}</p>}
                 {importWarnings && (
-                  <p className="mt-2 text-xs text-yellow-600 dark:text-yellow-400 whitespace-pre-line">
-                    {importWarnings}
-                  </p>
+                  <p className="mt-2 text-xs text-warning whitespace-pre-line">{importWarnings}</p>
                 )}
               </div>
-              <div className="w-2/3">
+              <div className="w-full md:w-2/3">
                 <div className="bg-secondary/30 rounded-lg border border-border overflow-hidden">
                   <div className="grid grid-cols-[1fr_1.5fr_auto] gap-px bg-border">
                     <div className="label-section bg-secondary/80 px-4 py-2 text-muted-foreground">
@@ -563,7 +601,7 @@ export default function ProjectSettings() {
                               setHasChanges(true)
                             }}
                             placeholder="KEY"
-                            className="w-full bg-transparent border-none text-sm font-mono text-primary focus:ring-0 px-2 py-1"
+                            className={`w-full bg-transparent border-none text-sm pointer-coarse:text-base font-mono text-primary rounded px-2 py-1 ${FOCUS_RING_CLASS}`}
                           />
                         </div>
                         <div className="bg-card p-2 relative group">
@@ -578,8 +616,8 @@ export default function ProjectSettings() {
                             }}
                             placeholder="Value"
                             className={cn(
-                              'w-full bg-transparent border-none text-sm font-mono focus:ring-0 px-2 py-1',
-                              envVar.isSecret ? 'text-muted-foreground' : 'text-green-400'
+                              `w-full bg-transparent border-none text-sm pointer-coarse:text-base font-mono rounded px-2 py-1 ${FOCUS_RING_CLASS}`,
+                              envVar.isSecret ? 'text-muted-foreground' : 'text-success'
                             )}
                           />
                         </div>
@@ -601,14 +639,14 @@ export default function ProjectSettings() {
 
           {/* Shell Settings Section */}
           <SettingsSection id="shell">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
-              <div className="w-1/3 pt-1">
+            <div className="flex flex-col items-start gap-6 border-b border-border pb-6 md:flex-row">
+              <div className="w-full pt-1 md:w-1/3">
                 <h2 className="text-lg font-medium text-foreground">Shell Settings</h2>
                 <p className="text-sm text-muted-foreground mt-1">
                   Customize the terminal experience for this workspace.
                 </p>
               </div>
-              <div className="w-2/3 space-y-4">
+              <div className="w-full space-y-4 md:w-full md:w-2/3">
                 <div>
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     Default Shell
@@ -623,7 +661,10 @@ export default function ProjectSettings() {
                           setShell(e.target.value)
                           setHasChanges(true)
                         }}
-                        className="w-full appearance-none bg-secondary/50 border border-border rounded-md pl-3 pr-10 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none cursor-pointer shadow-sm"
+                        className={cn(
+                          PANEL_FIELD_CLASS,
+                          'w-full cursor-pointer appearance-none rounded-md py-2 pl-3 pr-10 text-sm'
+                        )}
                       >
                         {availableShells?.available && availableShells.available.length > 0 ? (
                           availableShells.available.map((s) => (
@@ -647,8 +688,8 @@ export default function ProjectSettings() {
 
           {/* Worktree Symlink Directories Section */}
           <SettingsSection id="symlinks">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
-              <div className="w-1/3 pt-1">
+            <div className="flex flex-col items-start gap-6 border-b border-border pb-6 md:flex-row">
+              <div className="w-full pt-1 md:w-1/3">
                 <h2 className="text-lg font-medium text-foreground">Worktree Symlinks</h2>
                 <p className="text-sm text-muted-foreground mt-1">
                   Directories to symlink from the project root into worktrees. This allows shared
@@ -662,10 +703,11 @@ export default function ProjectSettings() {
                     disabled={symlinkLoading || !activeProject?.isGitRepo}
                     className="text-xs flex items-center text-primary hover:text-primary/80 font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                   >
-                    <RefreshCw
-                      size={14}
-                      className={`mr-1 ${symlinkLoading ? 'animate-spin' : ''}`}
-                    />
+                    {symlinkLoading ? (
+                      <Spinner size={14} decorative className="mr-1" />
+                    ) : (
+                      <RefreshCw size={14} className="mr-1" />
+                    )}
                     Sync from .gitignore
                   </button>
                   <button
@@ -676,7 +718,7 @@ export default function ProjectSettings() {
                   </button>
                 </div>
               </div>
-              <div className="w-2/3">
+              <div className="w-full md:w-2/3">
                 <div className="bg-secondary/30 rounded-lg border border-border p-3 space-y-2">
                   {symlinkDirs.length === 0 ? (
                     <p className="text-xs text-muted-foreground text-center py-4">
@@ -692,7 +734,10 @@ export default function ProjectSettings() {
                           value={dir}
                           onChange={(e) => updateSymlinkDir(index, e.target.value)}
                           placeholder="e.g. node_modules"
-                          className="flex-1 bg-secondary/50 border border-border rounded px-2 py-1 text-sm font-mono text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                          className={cn(
+                            PANEL_FIELD_CLASS,
+                            'flex-1 rounded px-2 py-1 font-mono text-sm'
+                          )}
                         />
                         <button
                           onClick={() => removeSymlinkDir(index)}
@@ -708,16 +753,41 @@ export default function ProjectSettings() {
             </div>
           </SettingsSection>
 
+          {/* Provider Section */}
+          <SettingsSection id="provider">
+            <div className="flex flex-col items-start gap-6 border-b border-border pb-6 md:flex-row">
+              <div className="w-full pt-1 md:w-1/3">
+                <h2 className="text-lg font-medium text-foreground">Provider</h2>
+                <p className="text-sm text-muted-foreground mt-1">
+                  Choose the account that this project&apos;s agent chats use.
+                </p>
+              </div>
+              <div className="w-full md:w-2/3">
+                <ProjectProviderSettings
+                  claude={claudeAccountDraft}
+                  onChange={() => setHasChanges(true)}
+                  onManageAccounts={() => {
+                    if (hasChanges) {
+                      toast.warning('Save or discard your changes first.')
+                      return
+                    }
+                    openAppSettings()
+                  }}
+                />
+              </div>
+            </div>
+          </SettingsSection>
+
           {/* Emergency Mode & Expert Workflows Section */}
           <SettingsSection id="emergency">
-            <div className="flex items-start gap-6">
-              <div className="w-1/3 pt-1">
+            <div className="flex flex-col items-start gap-6 md:flex-row">
+              <div className="w-full pt-1 md:w-1/3">
                 <h2 className="text-lg font-medium text-foreground">Emergency Mode</h2>
                 <p className="text-sm text-muted-foreground mt-1">
                   Power-user workflow settings for incident response and rapid worktree operations.
                 </p>
               </div>
-              <div className="w-2/3">
+              <div className="w-full md:w-2/3">
                 <div className="bg-secondary/30 rounded-lg border border-border p-4 space-y-4">
                   <div className="flex items-center justify-between">
                     <div>
@@ -728,17 +798,11 @@ export default function ProjectSettings() {
                         Bypass non-essential prompts during worktree operations.
                       </p>
                     </div>
-                    <label className="relative inline-flex items-center cursor-pointer">
-                      <input
-                        type="checkbox"
-                        className="sr-only peer"
-                        checked={skipConfirmations}
-                        onChange={(e) => {
-                          setSkipConfirmations(e.target.checked)
-                        }}
-                      />
-                      <div className="w-9 h-5 bg-secondary rounded-full peer peer-checked:bg-primary after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-popover after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
-                    </label>
+                    <Switch
+                      aria-label="Skip Confirmation Dialogs"
+                      checked={skipConfirmations}
+                      onCheckedChange={setSkipConfirmations}
+                    />
                   </div>
                   <div className="flex items-center justify-between">
                     <div>
@@ -749,17 +813,11 @@ export default function ProjectSettings() {
                         Use default symlink settings when creating worktrees.
                       </p>
                     </div>
-                    <label className="relative inline-flex items-center cursor-pointer">
-                      <input
-                        type="checkbox"
-                        className="sr-only peer"
-                        checked={skipGitignoreSelection}
-                        onChange={(e) => {
-                          setSkipGitignoreSelection(e.target.checked)
-                        }}
-                      />
-                      <div className="w-9 h-5 bg-secondary rounded-full peer peer-checked:bg-primary after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-popover after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:after:translate-x-full"></div>
-                    </label>
+                    <Switch
+                      aria-label="Skip .gitignore Selection"
+                      checked={skipGitignoreSelection}
+                      onCheckedChange={setSkipGitignoreSelection}
+                    />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-foreground mb-1">
@@ -772,7 +830,10 @@ export default function ProjectSettings() {
                         setDefaultBranchPrefix(e.target.value)
                       }}
                       placeholder="feature/"
-                      className="w-full bg-secondary/50 border border-border rounded-md px-3 py-2 text-sm font-mono text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none"
+                      className={cn(
+                        PANEL_FIELD_CLASS,
+                        'w-full rounded-md px-3 py-2 font-mono text-sm'
+                      )}
                     />
                     <p className="text-xs text-muted-foreground mt-1">
                       Prefix for new branch naming (e.g. "feature/", "hotfix/").
@@ -784,29 +845,8 @@ export default function ProjectSettings() {
           </SettingsSection>
         </SettingsLayout>
 
-        {/* Save Bar */}
-        {hasChanges && (
-          <div className="absolute bottom-0 left-0 right-0 p-4 bg-card border-t border-border flex justify-end items-center gap-4 z-10 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
-            <span className="text-sm text-muted-foreground mr-auto flex items-center">
-              <Info size={14} className="mr-2 text-yellow-500" />
-              <span className="opacity-80">You have unsaved changes</span>
-            </span>
-            <button
-              onClick={() => setHasChanges(false)}
-              className="px-4 py-2 text-sm font-medium text-secondary-foreground hover:text-foreground hover:bg-secondary rounded transition-colors"
-            >
-              Discard
-            </button>
-            <button
-              onClick={handleSave}
-              className="bg-primary hover:bg-primary/90 text-primary-foreground text-sm font-medium py-2 px-6 rounded shadow-lg shadow-primary/20 transition-all flex items-center"
-            >
-              <Save size={14} className="mr-2" />
-              Save Changes
-            </button>
-          </div>
-        )}
-      </main>
+        {/* Save bar is rendered in the modal footer above */}
+      </SettingsModal>
 
       <NewProjectModal
         isOpen={isNewProjectModalOpen}
@@ -823,7 +863,7 @@ export default function ProjectSettings() {
         variant="danger"
         onConfirm={() => {
           setIsCloseConfirmOpen(false)
-          navigate('/')
+          close()
         }}
         onCancel={() => setIsCloseConfirmOpen(false)}
       />

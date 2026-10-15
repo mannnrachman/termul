@@ -29,6 +29,10 @@
 //! The spawned [`tokio::process::Child`] is returned to the caller
 //! ([`RemoteServerState`]) so `stop()` can kill it alongside the Axum drain,
 //! and `kill_on_drop(true)` is a safety net for the panic/abort path.
+//! The pipe scanners keep draining the child's stdout/stderr for the whole
+//! tunnel lifetime — closing the read ends early kills cloudflared with
+//! EPIPE/SIGPIPE seconds after the URL appears (issue #593). Stopping the
+//! tunnel kills the child, which closes the pipes and lets the scanners exit.
 //! cloudflared provides edge TLS; application-level auth lands in Epic 2 —
 //! until then the random ephemeral URL is the only gate.
 
@@ -236,9 +240,7 @@ async fn probe_tunnel_ready_with(
 /// timeout (a slow edge / cold start must not block the connect UI).
 pub async fn log_tunnel_reachability(url: String) {
     match probe_tunnel_ready(&url).await {
-        Ok(()) => log::info!(
-            "cloudflared tunnel reachable — edge routes to origin ({url})"
-        ),
+        Ok(()) => log::info!("cloudflared tunnel reachable — edge routes to origin ({url})"),
         Err(e) => log::warn!(
             "cloudflared tunnel not confirmed reachable within deadline ({url}): {e} \
              — QR shown anyway; rescan if the page doesn't load"
@@ -269,12 +271,10 @@ pub async fn start_quick_tunnel(port: u16) -> Result<QuickTunnel, String> {
         .kill_on_drop(true);
     configure_background_command(&mut command);
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| {
-            log::error!("cloudflared failed to spawn at {path}: {e}");
-            format!("cloudflared binary not found at {path}: {e}")
-        })?;
+    let mut child = command.spawn().map_err(|e| {
+        log::error!("cloudflared failed to spawn at {path}: {e}");
+        format!("cloudflared binary not found at {path}: {e}")
+    })?;
     log::info!(
         "cloudflared spawned (pid={:?}) from {path}; waiting for tunnel URL…",
         child.id()
@@ -330,6 +330,14 @@ pub async fn start_quick_tunnel(port: u16) -> Result<QuickTunnel, String> {
 /// Read lines from `reader` and fire the first trycloudflare URL match through
 /// `url_tx`. On EOF without a match it drops the sender so the caller's oneshot
 /// resolves with `Err` (→ "exited before producing a URL").
+///
+/// After the URL is delivered the scanner **keeps draining** the pipe until
+/// EOF instead of returning. `start_quick_tunnel` `take()`s the child's
+/// stdout/stderr handles, so this task is the sole owner of the read ends —
+/// returning early closes them, cloudflared's next log write hits a closed
+/// pipe (EPIPE/SIGPIPE), and the tunnel dies seconds after the QR appears
+/// (issue #593). The child is killed on tunnel stop, which closes the pipes
+/// and lets the scanner reach EOF and exit cleanly.
 fn spawn_line_scanner<R>(reader: R, url_tx: std::sync::Arc<Mutex<Option<oneshot::Sender<String>>>>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -348,7 +356,8 @@ where
                         if let Some(tx) = url_tx.lock().await.take() {
                             let _ = tx.send(m.as_str().to_string());
                         }
-                        return;
+                        // Do NOT return here — keep draining so cloudflared's
+                        // read end stays open (issue #593).
                     }
                 }
                 Err(_) => break,
@@ -360,127 +369,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sidecar_name_is_nonempty() {
-        assert!(!cloudflared_sidecar_name().is_empty());
-    }
-
-    #[test]
-    fn resolve_path_returns_a_string_and_known_source() {
-        let (path, source) = resolve_cloudflared_path();
-        assert!(!path.is_empty());
-        // "env" only with the env var set; "sidecar" when a bundled file is
-        // found; "path" is the bare-name fallback (dev/CI without the binary).
-        assert!(
-            matches!(source.as_str(), "env" | "sidecar" | "path"),
-            "unexpected source: {source}"
-        );
-    }
-
-    #[test]
-    fn detect_caches_first_resolution() {
-        let a = detect_cloudflared_path();
-        let b = detect_cloudflared_path();
-        assert_eq!(a, b, "detect_cloudflared_path must be idempotent");
-    }
-
-    #[test]
-    fn url_regex_matches_trycloudflare_hostnames() {
-        let line = "2026-07-30 INF Your quick Tunnel has been created! Visit it at: https://foo-bar-baz.trycloudflare.com";
-        let m = TRY_TUNNEL_URL_RE.find(line).expect("must match");
-        assert_eq!(m.as_str(), "https://foo-bar-baz.trycloudflare.com");
-    }
-
-    #[test]
-    fn url_regex_matches_inside_json_logs() {
-        let line = "{\"level\":\"info\",\"url\":\"https://random-words-1234.trycloudflare.com\"}";
-        let m = TRY_TUNNEL_URL_RE.find(line).expect("must match");
-        assert_eq!(m.as_str(), "https://random-words-1234.trycloudflare.com");
-    }
-
-    #[test]
-    fn url_regex_ignores_localhost_urls() {
-        // The QR must encode the PUBLIC tunnel URL, never the local one.
-        assert!(TRY_TUNNEL_URL_RE
-            .find("listening on http://localhost:5123")
-            .is_none());
-    }
-
-    #[test]
-    fn url_regex_ignores_arbitrary_https_urls() {
-        assert!(TRY_TUNNEL_URL_RE
-            .find("redirect to https://example.com/path")
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn probe_returns_err_for_unreachable_url_near_deadline() {
-        // Port 1 on loopback → connection refused (fast), so each GET returns
-        // immediately; the 2s deadline bounds total elapsed time. Asserts the
-        // probe gives up near the deadline (never hangs) + surfaces the error.
-        let start = std::time::Instant::now();
-        let result = probe_tunnel_ready_with(
-            "http://127.0.0.1:1/",
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_millis(250),
-        )
-        .await;
-        assert!(result.is_err(), "unreachable URL must not be reported ready");
-        // Tight bound: the deadline + capped retry sleep can't overshoot by a
-        // full interval, so ~2s + small epsilon — well under 3s.
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
-            "probe must give up near the deadline, not hang; took {:?}",
-            start.elapsed()
-        );
-        assert!(result.unwrap_err().contains("not reachable within 2s"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn probe_bounded_by_deadline_against_hanging_listener() {
-        // A listener that accepts the TCP connection but never sends an HTTP
-        // response — so the only thing that unblocks each GET is the probe's
-        // per-request timeout. This exercises the timeout + capped-retry-sleep
-        // path the port-1 (instant-refuse) test can't.
-        let addr = spawn_hanging_listener().await;
-        let url = format!("http://{addr}/");
-        let start = std::time::Instant::now();
-        let result = probe_tunnel_ready_with(
-            &url,
-            std::time::Duration::from_secs(2),
-            std::time::Duration::from_millis(500),
-        )
-        .await;
-        assert!(result.is_err(), "hanging listener must not be reported ready");
-        // The per-request timeout is capped to the remaining deadline, so total
-        // wait must hug the 2s bound — not the 3s per-request default.
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(3),
-            "probe overshot the deadline: {:?}",
-            start.elapsed()
-        );
-    }
-
-    /// A local TCP listener that accepts connections but never sends an HTTP
-    /// response, so a probe client's per-request timeout is the only unblock.
-    async fn spawn_hanging_listener() -> std::net::SocketAddr {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind hanging listener");
-        let addr = listener.local_addr().expect("local addr");
-        tokio::spawn(async move {
-            // Accept connections but never send an HTTP response — a probe
-            // client's per-request timeout is the only unblock.
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let _ = tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-                    drop(stream);
-                });
-            }
-        });
-        addr
-    }
-}
+mod tests;

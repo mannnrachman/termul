@@ -104,14 +104,60 @@ export default defineConfig({
   define: {
     'import.meta.env.PACKAGE_VERSION': JSON.stringify(pkg.version),
     // Feature-gate signal for Story 1.5+ (desktop-only path exclusion).
-    'import.meta.env.TERMUL_WEB': JSON.stringify(true)
+    'import.meta.env.TERMUL_WEB': JSON.stringify(true),
+    // CAP-3: build-time app version for `getCurrentAppVersion()` web branch
+    // (tauri-release-notes.ts). Desktop reads version via Tauri `getVersion`;
+    // the web client has no Tauri runtime, so inject the package version as a
+    // string literal here. Tests run under Vitest (not this config) and read
+    // `undefined`, which the facade downgrades to `'0.0.0'`.
+    'import.meta.env.VITE_APP_VERSION': JSON.stringify(pkg.version)
   },
 
   build: {
     outDir: 'dist-web',
     emptyOutDir: true,
     rolldownOptions: {
-      input: path.resolve(__dirname, 'index.html')
+      input: path.resolve(__dirname, 'index.html'),
+      output: {
+        codeSplitting: {
+          groups: [
+            {
+              name: 'react-vendor',
+              test: /node_modules[\\/](react|react-dom|scheduler)\//,
+              priority: 30
+            },
+            {
+              name: 'radix-vendor',
+              test: /node_modules[\\/]@radix-ui\//,
+              priority: 25
+            },
+            {
+              name: 'framer-vendor',
+              test: /node_modules[\\/]framer-motion\//,
+              priority: 20
+            },
+            {
+              name: 'entry-vendor',
+              test: /node_modules[\\/]/,
+              tags: ['$initial'],
+              priority: 15
+            },
+            {
+              // App-internal shared modules (stores/hooks/lib) that are in the
+              // initial/entry chunk peel into a sibling chunk loaded in parallel
+              // with the entry — same codeSplitting technique as `entry-vendor`,
+              // applied to app-internal shared code so the entry chunk holds only
+              // the UI shell + lazy wrappers. NOT lazy-loading (loads
+              // synchronously); the UI shell (App/WorkspaceLayout/PaneContent/
+              // AgentLauncher) stays in the entry per the spec's first-paint intent.
+              name: 'app-shared',
+              test: /src[\\/]renderer[\\/](stores|hooks|lib)[\\/]/,
+              tags: ['$initial'],
+              priority: 12
+            }
+          ]
+        }
+      }
     },
     target: 'esnext'
   }

@@ -22,25 +22,63 @@
 
 import type { DirectoryEntry, IpcResult } from '@shared/types/ipc.types'
 import { AnimatePresence, motion } from 'framer-motion'
-import { ArrowUp, ChevronRight, Folder, Loader2, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { ArrowUp, ChevronRight, Folder, X } from '@/components/icons'
+import { Button } from '@/components/ui/button'
+import { Spinner } from '@/components/ui/spinner'
+import { acpCatalogApi } from '@/lib/acp-catalog-api'
 import { _resetWebDirectoryPickerForTesting, registerWebDirectoryPicker } from '@/lib/dialog-api'
+import { claimEscape } from '@/lib/escape-claim'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { cn } from '@/lib/utils'
 import { webServerDialog } from '@/lib/web-server-api'
+import { useOverlayRegistration } from '@/stores/overlay-stack-store'
 
 /**
- * The initial path the picker opens at. Patch A: the empty-string default made
- * `GET /fs/browse?path=` hit `fs::read_dir("")` → ENOENT → the picker showed
- * an error and the user was stuck (Select/Up disabled). Seed with the host
- * filesystem root instead — `fs::read_dir("C:\\")` / `fs::read_dir("/")`
- * succeed cross-platform, so the picker actually lists directories on first
- * open. Detect platform client-side (the existing `navigator.platform` pattern
- * from `NewProjectModal.tsx:40`); Windows uses the system drive root, POSIX
- * uses `/`.
+ * Sync platform fallback for the picker's initial path. Evaluated at call time
+ * (not module load) so tests can stub `navigator.platform`. Used only when the
+ * ACP catalog (the host-OS source of truth) is unavailable, so the picker
+ * never fails to open. Mirrors the legacy `navigator.platform` seed:
+ * Windows → system drive root, POSIX → `/`.
  */
-const INITIAL_PATH =
-  typeof navigator !== 'undefined' && navigator.platform.startsWith('Win') ? 'C:\\' : '/'
+function getPlatformFallbackPath(): string {
+  return typeof navigator !== 'undefined' && navigator.platform.startsWith('Win') ? 'C:\\' : '/'
+}
+
+/**
+ * Resolve the picker's initial path from the host's reported OS via the ACP
+ * catalog (CAP-3 / GH-589). The host OS — not the client browser's
+ * `navigator.platform` — is the source of truth: a Windows browser against a
+ * Linux server must open at `/`, not `C:\` (otherwise `GET /fs/browse?path=C:\`
+ * hits `fs::read_dir("C:\\")` on Linux → ENOENT → "no existing ancestor"
+ * error). Maps `linux`/`macos` → `/`, `windows` → `C:\`. Falls back to
+ * `navigator.platform` only when the catalog call fails OR stalls past a 3s
+ * timeout (F13) so `dialogApi.selectDirectory()` never hangs. The opener
+ * (`loadPath(startPath)`) is async so the await lands cleanly.
+ */
+async function resolveInitialPath(): Promise<string> {
+  try {
+    // F13: race the catalog call against a 3s timeout — a stalled catalog must
+    // not block the picker opener (dialogApi.selectDirectory() must resolve so
+    // the user can browse). A timeout resolves null → fall through to the
+    // navigator.platform fallback.
+    const result = await Promise.race([
+      acpCatalogApi.listCatalog(),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000))
+    ])
+    if (result && result.success && result.data?.host?.os) {
+      const os = result.data.host.os
+      if (os === 'windows') return 'C:\\'
+      if (os === 'linux' || os === 'macos' || os === 'darwin') return '/'
+      // Unknown host os: the catalog is the authority, so default to the
+      // POSIX root rather than the client browser's platform.
+      return '/'
+    }
+  } catch {
+    // Fall through to the navigator.platform fallback.
+  }
+  return getPlatformFallbackPath()
+}
 
 interface PendingSelection {
   resolve: (result: IpcResult<string>) => void
@@ -142,7 +180,9 @@ export function DirectoryPicker(): React.JSX.Element {
   // Desktop mode never mounts this component (see App.tsx), but guard anyway so
   // a misconfigured import is a no-op rather than a broken modal.
   const [isOpen, setIsOpen] = useState(false)
-  const [currentPath, setCurrentPath] = useState<string>(INITIAL_PATH)
+  // Empty until the opener resolves the host OS initial path (CAP-3). The
+  // picker is closed while empty, so the brief pre-resolve state is invisible.
+  const [currentPath, setCurrentPath] = useState<string>('')
   const [entries, setEntries] = useState<DirectoryEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -161,11 +201,18 @@ export function DirectoryPicker(): React.JSX.Element {
   // — otherwise `dialogApi.selectDirectory()` hangs forever.
   const pendingRef = useRef<PendingSelection | null>(pending)
   pendingRef.current = pending
+  // CodeRabbit: an open/close/nav epoch so a stale async result (from
+  // resolveInitialPath or browseDirectory) cannot apply state after the
+  // picker closed/reopened/navigated. Incremented on open + each loadPath +
+  // close; captured before the await, verified after.
+  const pickerSessionRef = useRef(0)
 
   const loadPath = useCallback(async (path: string) => {
+    const session = ++pickerSessionRef.current
     setLoading(true)
     setError(null)
     const result = await webServerDialog.browseDirectory(path)
+    if (pickerSessionRef.current !== session) return // stale — a newer open/close/nav superseded this browse
     if (result.success && result.data) {
       // Directories only — files aren't selectable in a folder picker.
       const dirs = result.data.filter((e) => e.type === 'directory')
@@ -181,9 +228,12 @@ export function DirectoryPicker(): React.JSX.Element {
       setCurrentPath(resolved)
     } else {
       // Failure (missing dir, transport error): show empty listing + the error
-      // message so the user understands why nothing is listed. Keep the path
-      // so the "go up" / "select current" affordances still make sense.
+      // message so the user understands why nothing is listed. Keep the
+      // requested path (the host-root seed from CAP-3) so the "go up" /
+      // "select current" affordances still make sense and the user is never
+      // stuck with an empty path bar (Patch A invariant).
       setEntries([])
+      setCurrentPath(path)
       if (!result.success) {
         setError(result.error || 'Unable to list this directory')
       }
@@ -201,10 +251,17 @@ export function DirectoryPicker(): React.JSX.Element {
       return new Promise<IpcResult<string>>((resolve) => {
         setPending({ resolve })
         setIsOpen(true)
-        // Load the initial listing when the picker opens. Read the latest
-        // `currentPath` via the ref (so we don't re-register on each nav).
-        const startPath = currentPathRef.current || INITIAL_PATH
-        void loadPath(startPath)
+        // CAP-3: resolve the initial path from the host OS via the ACP
+        // catalog; falls back to navigator.platform only when the catalog is
+        // unavailable. `currentPathRef` holds a prior navigation when the
+        // picker re-opens (it is reset to '' on close so each open re-resolves
+        // the host OS rather than pinning the client browser's platform).
+        void (async () => {
+          const session = ++pickerSessionRef.current
+          const startPath = currentPathRef.current || (await resolveInitialPath())
+          if (pickerSessionRef.current !== session) return // closed during resolve
+          void loadPath(startPath)
+        })()
       })
     })
     return () => {
@@ -228,12 +285,15 @@ export function DirectoryPicker(): React.JSX.Element {
 
   const close = useCallback(
     (result: IpcResult<string>) => {
+      pickerSessionRef.current++ // invalidate any in-flight resolveInitialPath/browseDirectory
       setIsOpen(false)
       setPending(null)
-      // Reset navigation state for the next open.
+      // Reset navigation state for the next open. Empty so the opener
+      // re-resolves the host OS initial path (CAP-3) rather than pinning the
+      // client browser's platform.
       setEntries([])
       setError(null)
-      setCurrentPath(INITIAL_PATH)
+      setCurrentPath('')
       pending?.resolve(result)
     },
     [pending]
@@ -251,6 +311,11 @@ export function DirectoryPicker(): React.JSX.Element {
     close({ success: false, error: 'No directory selected', code: 'CANCELLED' })
   }, [close])
 
+  // Mobile web shell: the picker opens above NewProjectModal (also on the
+  // overlay stack), so system back must close the picker first, not the modal
+  // underneath it. Inert on desktop.
+  useOverlayRegistration('directory-picker', isOpen, handleCancel, { mobileShellOnly: true })
+
   const handleNavigateInto = useCallback(
     (entry: DirectoryEntry) => {
       // Prefer the server-provided full path; fall back to joining if absent.
@@ -267,16 +332,20 @@ export function DirectoryPicker(): React.JSX.Element {
   }, [currentPath, loadPath])
 
   // Escape to cancel (matches NewProjectModal / ConfirmDialog convention).
+  // Capture phase, so the picker (the topmost layer) takes the Esc first and
+  // claims it: the NewProjectModal underneath ignores a claimed Esc (one Esc
+  // closes one layer), and preventDefault() keeps Radix layers under it out too.
   useEffect(() => {
     if (!isOpen) return
     const handleEscape = (e: globalThis.KeyboardEvent): void => {
       if (e.key === 'Escape') {
         e.preventDefault()
+        claimEscape(e)
         handleCancel()
       }
     }
-    window.addEventListener('keydown', handleEscape)
-    return () => window.removeEventListener('keydown', handleEscape)
+    window.addEventListener('keydown', handleEscape, { capture: true })
+    return () => window.removeEventListener('keydown', handleEscape, { capture: true })
   }, [isOpen, handleCancel])
 
   const canGoUp = parentPath(currentPath) !== null
@@ -288,7 +357,7 @@ export function DirectoryPicker(): React.JSX.Element {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center"
+          className="fixed inset-0 bg-overlay/60 backdrop-blur-sm z-[60] flex items-center justify-center"
           onClick={handleCancel}
         >
           <motion.div
@@ -339,7 +408,7 @@ export function DirectoryPicker(): React.JSX.Element {
             <div className="flex-1 overflow-y-auto p-1 min-h-[200px]">
               {loading ? (
                 <div className="flex items-center justify-center py-8 text-muted-foreground text-xs">
-                  <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                  <Spinner size={16} decorative className="mr-2" />
                   Listing directory...
                 </div>
               ) : entries.length === 0 ? (
@@ -378,24 +447,12 @@ export function DirectoryPicker(): React.JSX.Element {
 
             {/* Footer */}
             <div className="px-4 py-3 bg-secondary/50 flex justify-end gap-2 border-t border-border flex-shrink-0">
-              <button
-                onClick={handleCancel}
-                className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
-              >
+              <Button type="button" variant="ghost" size="sm" onClick={handleCancel}>
                 Cancel
-              </button>
-              <button
-                onClick={handleSelectCurrent}
-                disabled={!currentPath}
-                className={cn(
-                  'px-3 py-1.5 text-xs font-medium rounded transition-all',
-                  currentPath
-                    ? 'bg-primary text-primary-foreground hover:bg-primary/90 shadow-md shadow-primary/20'
-                    : 'bg-primary/50 text-primary-foreground/70 cursor-not-allowed'
-                )}
-              >
+              </Button>
+              <Button type="button" size="sm" onClick={handleSelectCurrent} disabled={!currentPath}>
                 Select Current Folder
-              </button>
+              </Button>
             </div>
           </motion.div>
         </motion.div>

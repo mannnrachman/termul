@@ -1,9 +1,36 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useAcpStore } from '@/stores/acp-store'
+import { seedSession } from '@/stores/acp-store/testkit'
+import { useWorktreeProgressStore } from '@/stores/worktree-progress-store'
 import { ChatMessageList } from './ChatMessageList'
 import type { TimelineItem } from './chat-timeline'
 
+const { mobileShellRef, virtualizerOverride } = vi.hoisted(() => ({
+  mobileShellRef: { current: false as boolean },
+  virtualizerOverride: { current: null as null | ((options: unknown) => unknown) }
+}))
+
+vi.mock('@/hooks/use-mobile-web-shell', () => ({
+  useMobileWebShell: () => mobileShellRef.current
+}))
+
+// Lets one suite force the windowed render path (jsdom has no layout, so the
+// real virtualizer yields no items and the list falls back to normal flow).
+vi.mock('@tanstack/react-virtual', async (importActual) => {
+  const actual = await importActual<typeof import('@tanstack/react-virtual')>()
+  return {
+    ...actual,
+    useVirtualizer: (options: Parameters<typeof actual.useVirtualizer>[0]) => {
+      // Always run the real hook so the hook order never depends on the override.
+      const real = actual.useVirtualizer(options)
+      return virtualizerOverride.current ? virtualizerOverride.current(options) : real
+    }
+  }
+})
+
 vi.mock('./ChatMessage', () => ({
+  AgentProse: ({ text }: { text: string }) => <div data-testid="agent-prose">{text}</div>,
   ChatMessage: ({
     message
   }: {
@@ -99,18 +126,65 @@ const thoughtItem: TimelineItem = {
 }
 
 describe('ChatMessageList', () => {
+  beforeEach(() => {
+    mobileShellRef.current = false
+    virtualizerOverride.current = null
+  })
+
   it.each([
     ['before content arrives', [userItem]],
     ['while a thought streams', [userItem, thoughtItem]],
     ['while a tool runs', [userItem, toolItem]],
     ['while an agent response streams', [userItem, streamingAgentItem]]
   ] satisfies Array<[string, TimelineItem[]]>)('shows open Working activity %s', (_, items) => {
-    render(
-      <ChatMessageList items={items} sessionId="session-1" agentId="agent-1" showRunningIndicator />
-    )
+    render(<ChatMessageList items={items} sessionId="session-1" showRunningIndicator />)
 
     const trigger = screen.getByRole('button', { name: /Working/ })
     expect(trigger).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('shows the OpenCode status line on the active turn and drops it when the notice clears', () => {
+    act(() => {
+      seedSession('session-1', 'agent-1')
+      useAcpStore.setState((s) => ({
+        sessions: {
+          ...s.sessions,
+          'session-1': {
+            ...s.sessions['session-1'],
+            opencodeNotice: { compaction: 'started', retryAttempt: null }
+          }
+        }
+      }))
+    })
+    const { rerender } = render(
+      <ChatMessageList items={[userItem]} sessionId="session-1" showRunningIndicator />
+    )
+    expect(screen.getByRole('button', { name: /Compacting context/ })).toBeInTheDocument()
+
+    act(() => {
+      useAcpStore.setState((s) => ({
+        sessions: {
+          ...s.sessions,
+          'session-1': {
+            ...s.sessions['session-1'],
+            opencodeNotice: { compaction: null, retryAttempt: 2 }
+          }
+        }
+      }))
+    })
+    rerender(<ChatMessageList items={[userItem]} sessionId="session-1" showRunningIndicator />)
+    expect(screen.getByRole('button', { name: /Retrying, attempt 2/ })).toBeInTheDocument()
+
+    act(() => {
+      useAcpStore.setState((s) => ({
+        sessions: {
+          ...s.sessions,
+          'session-1': { ...s.sessions['session-1'], opencodeNotice: undefined }
+        }
+      }))
+    })
+    rerender(<ChatMessageList items={[userItem]} sessionId="session-1" showRunningIndicator />)
+    expect(screen.getByRole('button', { name: /Working/ })).toBeInTheDocument()
   })
 
   it('collapses completed activity while keeping the final response visible', async () => {
@@ -118,7 +192,6 @@ describe('ChatMessageList', () => {
       <ChatMessageList
         items={[userItem, toolItem, streamingAgentItem]}
         sessionId="session-1"
-        agentId="agent-1"
         showRunningIndicator
       />
     )
@@ -127,7 +200,6 @@ describe('ChatMessageList', () => {
       <ChatMessageList
         items={[userItem, completedToolItem, streamingAgentItem, finalAgentItem]}
         sessionId="session-1"
-        agentId="agent-1"
         showRunningIndicator={false}
       />
     )
@@ -141,12 +213,70 @@ describe('ChatMessageList', () => {
     expect(screen.getByText('Final response')).toBeInTheDocument()
   })
 
+  it('keeps delegation details open when the parent turn completes', async () => {
+    const delegation: TimelineItem = {
+      kind: 'tool',
+      key: 'task-1',
+      tool: {
+        toolCallId: 'task-1',
+        title: 'Audit branch',
+        kind: 'think',
+        rawInput: {
+          subagent_type: 'explorer',
+          description: 'Audit branch',
+          prompt: 'Review the branch without editing.'
+        },
+        timestamp: 1_500,
+        seq: 2
+      }
+    }
+    const { rerender } = render(
+      <ChatMessageList
+        items={[userItem, delegation, streamingAgentItem]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /audit branch/i }))
+    expect(screen.getByRole('dialog', { name: 'Audit branch' })).toHaveTextContent('Running')
+
+    rerender(
+      <ChatMessageList
+        items={[
+          userItem,
+          {
+            ...delegation,
+            tool: {
+              ...delegation.tool,
+              status: 'completed',
+              rawOutput: { text: 'No changes needed.' }
+            }
+          },
+          finalAgentItem
+        ]}
+        sessionId="session-1"
+        showRunningIndicator={false}
+      />
+    )
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Worked for 3s' })).toHaveAttribute(
+        'aria-expanded',
+        'false'
+      )
+      expect(within(screen.getByRole('log')).queryByText('Audit branch')).not.toBeInTheDocument()
+    })
+    expect(screen.getByRole('dialog', { name: 'Audit branch' })).toHaveTextContent(
+      'No changes needed.'
+    )
+  })
+
   it('allows keyboard-accessible reopening after completion', () => {
     render(
       <ChatMessageList
         items={[userItem, completedToolItem, finalAgentItem]}
         sessionId="session-1"
-        agentId="agent-1"
         showRunningIndicator={false}
       />
     )
@@ -192,7 +322,6 @@ describe('ChatMessageList', () => {
       <ChatMessageList
         items={[userItem, completedToolItem, attachmentItem, finalAgentItem, emptyTailItem]}
         sessionId="session-1"
-        agentId="agent-1"
         showRunningIndicator={false}
       />
     )
@@ -213,7 +342,6 @@ describe('ChatMessageList', () => {
       <ChatMessageList
         items={[userItem, streamingAgentItem]}
         sessionId="session-1"
-        agentId="agent-1"
         showRunningIndicator
       />
     )
@@ -223,27 +351,145 @@ describe('ChatMessageList', () => {
       <ChatMessageList
         items={[userItem, streamingAgentItem, toolItem]}
         sessionId="session-1"
-        agentId="agent-1"
         showRunningIndicator
       />
     )
 
     expect(screen.getByTestId('message-agent-1')).toBe(liveNode)
-    expect(screen.getByText('Reading files')).toBeInTheDocument()
+    expect(screen.getByText('Reading files…')).toBeInTheDocument()
   })
 
-  it('keeps a failed tool-only turn open and visible', () => {
+  it('collapses a failed tool-only turn but flags it for attention', () => {
     render(
       <ChatMessageList
         items={[userItem, failedToolItem]}
         sessionId="session-1"
-        agentId="agent-1"
         showRunningIndicator={false}
       />
     )
 
     const trigger = screen.getByRole('button', { name: /Worked.*needs attention/ })
-    expect(trigger).toHaveAttribute('aria-expanded', 'true')
-    expect(screen.getByText('Run checks')).toBeInTheDocument()
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+  })
+})
+
+describe('ChatMessageList worktree progress row', () => {
+  beforeEach(() => {
+    useWorktreeProgressStore.setState({ ops: {} })
+  })
+
+  it('renders a worktree-kind item as a progress row after the user message', () => {
+    useWorktreeProgressStore.getState().begin('wt-list-1', 'feat/row')
+    render(
+      <ChatMessageList
+        items={[userItem, { kind: 'worktree', key: 'worktree:wt-list-1', progressId: 'wt-list-1' }]}
+        sessionId="session-1"
+        showRunningIndicator={false}
+      />
+    )
+
+    // The 'worktree' render branch mounts WorktreeCreationCard for the op.
+    const title = screen.getByText('Creating worktree..')
+    expect(title).toBeInTheDocument()
+    expect(screen.getByText('Preparing workspace')).toBeInTheDocument()
+    // Top-level position: the row lands between the user message and any
+    // agent activity (never inside the turn-activity disclosure).
+    const userEl = screen.getByTestId('message-user-1')
+    expect(userEl.compareDocumentPosition(title) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+})
+
+describe('ChatMessageList log live semantics', () => {
+  beforeEach(() => {
+    mobileShellRef.current = false
+    virtualizerOverride.current = null
+  })
+
+  afterEach(() => {
+    mobileShellRef.current = false
+    virtualizerOverride.current = null
+  })
+
+  const items = [userItem, finalAgentItem]
+
+  function renderList(): void {
+    render(
+      <ChatMessageList
+        items={items}
+        sessionId="session-1"
+        agentId="agent-1"
+        showRunningIndicator={false}
+      />
+    )
+  }
+
+  it('keeps the polite log with additions relevance outside the mobile shell', () => {
+    mobileShellRef.current = false
+    renderList()
+
+    const log = screen.getByRole('log')
+    expect(log).toHaveAttribute('aria-live', 'polite')
+    expect(log).toHaveAttribute('aria-relevant', 'additions')
+  })
+
+  it('turns the log off on the mobile shell: role stays, aria-live is off, no aria-relevant', () => {
+    mobileShellRef.current = true
+    renderList()
+
+    const log = screen.getByRole('log')
+    expect(log).toHaveAttribute('role', 'log')
+    expect(log).toHaveAttribute('aria-live', 'off')
+    expect(log).not.toHaveAttribute('aria-relevant')
+    // The rows are still all there; only the announcements stopped.
+    expect(screen.getByTestId('message-user-1')).toBeInTheDocument()
+    expect(screen.getByTestId('message-agent-final')).toBeInTheDocument()
+  })
+
+  it.each([
+    ['mobile shell', true, 'off', null],
+    ['desktop', false, 'polite', 'additions']
+  ])('applies the same semantics on the windowed path (%s)', (_, mobile, live, relevant) => {
+    mobileShellRef.current = mobile
+    virtualizerOverride.current = () => ({
+      getVirtualItems: () => [
+        { index: 0, key: 'user-1', start: 0, end: 100, size: 100, lane: 0 },
+        { index: 1, key: 'agent-final', start: 100, end: 200, size: 100, lane: 0 }
+      ],
+      getTotalSize: () => 200,
+      measureElement: () => undefined,
+      scrollToIndex: () => undefined,
+      range: { startIndex: 0, endIndex: 1 }
+    })
+    renderList()
+
+    const log = screen.getByRole('log')
+    // The windowed branch positions rows absolutely inside a fixed-height log.
+    expect(log.style.position).toBe('relative')
+    expect(log).toHaveAttribute('aria-live', live)
+    if (relevant === null) expect(log).not.toHaveAttribute('aria-relevant')
+    else expect(log).toHaveAttribute('aria-relevant', relevant)
+  })
+
+  it('still renders the empty state without a log (hook order is stable across the early return)', () => {
+    mobileShellRef.current = true
+    const { rerender } = render(
+      <ChatMessageList
+        items={[]}
+        sessionId="session-1"
+        agentId="agent-1"
+        showRunningIndicator={false}
+      />
+    )
+    expect(screen.queryByRole('log')).not.toBeInTheDocument()
+
+    rerender(
+      <ChatMessageList
+        items={items}
+        sessionId="session-1"
+        agentId="agent-1"
+        showRunningIndicator={false}
+      />
+    )
+    expect(screen.getByRole('log')).toHaveAttribute('aria-live', 'off')
   })
 })

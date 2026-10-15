@@ -1,9 +1,13 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { mockFetch, mockIsTauriContext, registeredPicker } = vi.hoisted(() => ({
+const { mockFetch, mockIsTauriContext, mockListCatalog, registeredPicker } = vi.hoisted(() => ({
   mockFetch: vi.fn(),
   mockIsTauriContext: vi.fn(),
+  // CAP-3: the picker resolves its initial path from the host OS via the
+  // catalog facade. Mocked here (not via fetch) so the browse fetch mocks
+  // below remain the sole source of /fs/browse responses.
+  mockListCatalog: vi.fn(),
   // Captured by the dialog-api mock when DirectoryPicker mounts; the test
   // invokes it the same way `dialogApi.selectDirectory()` would in web mode.
   registeredPicker: { current: null as null | (() => Promise<unknown>) }
@@ -11,6 +15,14 @@ const { mockFetch, mockIsTauriContext, registeredPicker } = vi.hoisted(() => ({
 
 vi.mock('@/lib/tauri-runtime', () => ({
   isTauriContext: mockIsTauriContext
+}))
+
+vi.mock('@/lib/acp-catalog-api', () => ({
+  acpCatalogApi: {
+    listCatalog: mockListCatalog,
+    setCatalogOptIn: vi.fn(),
+    isCatalogOptedIn: vi.fn()
+  }
 }))
 
 vi.mock('@/lib/dialog-api', () => ({
@@ -22,6 +34,17 @@ vi.mock('@/lib/dialog-api', () => ({
   }
 }))
 
+// Overlay back-stack boundary logs must not POST through the mocked fetch.
+vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
+
+import { isEscapeClaimed } from '@/lib/escape-claim'
+import {
+  armMobileOverlayBackStack,
+  pressSystemBack,
+  settleOverlayBackStack,
+  waitForSentinelDepth
+} from '@/lib/test-utils/overlay-back-stack'
+import { readOverlaySentinelDepth, useOverlayStackStore } from '@/stores/overlay-stack-store'
 import { __testing, DirectoryPicker } from './DirectoryPicker'
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -67,17 +90,41 @@ function openPicker(): Promise<unknown> {
 }
 
 describe('DirectoryPicker', () => {
+  let originalPlatformDesc: PropertyDescriptor | undefined
+
   beforeEach(() => {
     vi.clearAllMocks()
     registeredPicker.current = null
     mockIsTauriContext.mockReturnValue(false)
     mockFetch.mockReset()
     vi.stubGlobal('fetch', mockFetch)
+    // Default catalog: a Linux host. Tests that need a different host OS or a
+    // catalog failure override with mockResolvedValueOnce.
+    mockListCatalog.mockResolvedValue({
+      success: true,
+      data: {
+        host: {
+          os: 'linux',
+          arch: 'x86_64',
+          runtimes: { npx: true, uvx: false, node: true, bun: false, python3: false }
+        },
+        agents: []
+      }
+    })
+    // Save navigator.platform so a CAP-3 test can stub it to 'Win32' and the
+    // afterEach restores it (jsdom's value differs per CI host).
+    originalPlatformDesc = Object.getOwnPropertyDescriptor(navigator, 'platform')
   })
 
   afterEach(() => {
     vi.unstubAllGlobals()
     registeredPicker.current = null
+    if (originalPlatformDesc) {
+      Object.defineProperty(navigator, 'platform', originalPlatformDesc)
+    } else {
+      // @ts-expect-error removing the own prop we added; restores prototype lookup
+      delete navigator.platform
+    }
   })
 
   it('does not register a picker in Tauri (desktop) context', async () => {
@@ -278,10 +325,11 @@ describe('DirectoryPicker', () => {
 
       const promise = openPicker()
 
-      // The initial browse targeted a NON-empty path (the host root), NOT
-      // the empty query string the pre-Patch-A default produced. The path is
-      // platform-dependent (`C:\` on Win32 jsdom, `/` on Linux jsdom) —
-      // either way it must NOT be empty.
+      // CAP-3: the opener awaits the host-OS catalog before browsing, so the
+      // browse fetch lands on a later microtask. Wait for it, then assert the
+      // initial browse targeted a NON-empty path (the host root from the
+      // catalog), NOT the empty query string the pre-Patch-A default produced.
+      await waitFor(() => expect(mockFetch).toHaveBeenCalled())
       const firstCall = String(mockFetch.mock.calls[0]?.[0] ?? '')
       expect(firstCall).toMatch(/\/fs\/browse\?path=/)
       // The path query param is non-empty (the encoded value is not "").
@@ -324,6 +372,274 @@ describe('DirectoryPicker', () => {
         error: 'No directory selected',
         code: 'CANCELLED'
       })
+    })
+  })
+
+  describe('Escape ordering (L-32)', () => {
+    afterEach(() => {
+      vi.restoreAllMocks()
+    })
+
+    it('takes Esc in the capture phase: a window bubble listener registered earlier sees it prevented and claimed', async () => {
+      mockFetch.mockResolvedValue(jsonResponse({ success: true, data: [] }))
+      // Registered before the picker opens, like NewProjectModal's window
+      // handler: a bubble-phase picker handler would run after it and the
+      // modal could not tell the picker already took the Esc.
+      const seen: boolean[] = []
+      const claimed: boolean[] = []
+      const earlier = (event: KeyboardEvent): void => {
+        if (event.key !== 'Escape') return
+        seen.push(event.defaultPrevented)
+        claimed.push(isEscapeClaimed(event))
+      }
+      window.addEventListener('keydown', earlier)
+      try {
+        render(<DirectoryPicker />)
+        await waitFor(() => expect(registeredPicker.current).not.toBeNull())
+        const promise = openPicker()
+        await waitFor(() =>
+          expect(screen.getByText('No subdirectories in this folder')).toBeInTheDocument()
+        )
+
+        fireEvent.keyDown(document.body, { key: 'Escape' })
+
+        expect(await promise).toEqual({
+          success: false,
+          error: 'No directory selected',
+          code: 'CANCELLED'
+        })
+        expect(seen).toEqual([true])
+        expect(claimed).toEqual([true])
+
+        // Closed: the picker's capture listener is gone, so a later Esc stays
+        // unprevented and unclaimed for the modal underneath.
+        fireEvent.keyDown(document.body, { key: 'Escape' })
+        expect(seen).toEqual([true, false])
+        expect(claimed).toEqual([true, false])
+      } finally {
+        window.removeEventListener('keydown', earlier)
+      }
+    })
+
+    it('ignores other keys', async () => {
+      mockFetch.mockResolvedValue(jsonResponse({ success: true, data: [] }))
+      const seen: boolean[] = []
+      const earlier = (event: KeyboardEvent): void => {
+        seen.push(event.defaultPrevented)
+      }
+      window.addEventListener('keydown', earlier)
+      try {
+        render(<DirectoryPicker />)
+        await waitFor(() => expect(registeredPicker.current).not.toBeNull())
+        const promise = openPicker()
+        await waitFor(() =>
+          expect(screen.getByText('No subdirectories in this folder')).toBeInTheDocument()
+        )
+
+        fireEvent.keyDown(document.body, { key: 'Enter' })
+        expect(seen).toEqual([false])
+        expect(screen.getByText('Select Project Folder')).toBeInTheDocument()
+
+        fireEvent.click(screen.getByText('Cancel'))
+        await promise
+      } finally {
+        window.removeEventListener('keydown', earlier)
+      }
+    })
+  })
+
+  describe('overlay back stack', () => {
+    const cancelled = { success: false, error: 'No directory selected', code: 'CANCELLED' }
+    const stackIds = (): string[] => useOverlayStackStore.getState().stack.map((entry) => entry.id)
+    let cleanup: () => void
+
+    beforeEach(() => {
+      window.history.replaceState(null, '', '#/base')
+      cleanup = armMobileOverlayBackStack()
+      mockFetch.mockResolvedValue(jsonResponse({ success: true, data: [] }))
+    })
+
+    afterEach(() => {
+      cleanup()
+      vi.restoreAllMocks()
+    })
+
+    /** Wrapped in an object: returning the opener's promise would be awaited away. */
+    async function openAndWaitForListing(): Promise<{ result: Promise<unknown> }> {
+      render(<DirectoryPicker />)
+      await waitFor(() => expect(registeredPicker.current).not.toBeNull())
+      const result = openPicker()
+      await waitFor(() =>
+        expect(screen.getByText('No subdirectories in this folder')).toBeInTheDocument()
+      )
+      return { result }
+    }
+
+    it('mobile shell: registers while open, and system back cancels the picker', async () => {
+      const { result } = await openAndWaitForListing()
+      expect(stackIds()).toEqual(['directory-picker'])
+      await waitForSentinelDepth(1)
+
+      await pressSystemBack()
+
+      expect(await result).toEqual(cancelled)
+      await waitFor(() =>
+        expect(screen.queryByText('Select Project Folder')).not.toBeInTheDocument()
+      )
+      expect(stackIds()).toEqual([])
+      expect(location.hash).toBe('#/base')
+      expect(readOverlaySentinelDepth(history.state)).toBe(0)
+    })
+
+    it('mobile shell: opened above NewProjectModal, back closes the picker and leaves the modal', async () => {
+      const closeModal = vi.fn()
+      useOverlayStackStore.getState().registerOverlay('new-project-modal:test', closeModal)
+      const { result } = await openAndWaitForListing()
+      await waitForSentinelDepth(2)
+
+      await pressSystemBack()
+
+      expect(await result).toEqual(cancelled)
+      expect(closeModal).not.toHaveBeenCalled()
+      expect(stackIds()).toEqual(['new-project-modal:test'])
+      await waitForSentinelDepth(1)
+    })
+
+    it('desktop shell: is inert, with no registration, history push or traversal', async () => {
+      useOverlayStackStore.getState().setMobileShell(false)
+      const pushSpy = vi.spyOn(history, 'pushState')
+      const backSpy = vi.spyOn(history, 'back')
+      const goSpy = vi.spyOn(history, 'go')
+
+      const { result } = await openAndWaitForListing()
+      expect(stackIds()).toEqual([])
+      fireEvent.keyDown(window, { key: 'Escape' })
+      expect(await result).toEqual(cancelled)
+      await settleOverlayBackStack()
+
+      expect(pushSpy).not.toHaveBeenCalled()
+      expect(backSpy).not.toHaveBeenCalled()
+      expect(goSpy).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('host-OS initial path resolution (CAP-3 / GH-589)', () => {
+    /** Stub navigator.platform so the browser reports Windows (POSIX CI default is Linux). */
+    function stubPlatformWin32(): void {
+      Object.defineProperty(navigator, 'platform', {
+        value: 'Win32',
+        configurable: true
+      })
+    }
+
+    it('opens at / when the catalog reports a Linux host, even on a Windows browser', async () => {
+      // Windows browser — navigator.platform says Win, but the host is Linux.
+      stubPlatformWin32()
+      expect(navigator.platform).toBe('Win32')
+      // Catalog (the host-OS source of truth) reports Linux.
+      mockListCatalog.mockResolvedValueOnce({
+        success: true,
+        data: {
+          host: {
+            os: 'linux',
+            arch: 'x86_64',
+            runtimes: { npx: true, uvx: false, node: true, bun: false, python3: false }
+          },
+          agents: []
+        }
+      })
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({ success: true, data: [dirEntry('home', '/home')] })
+      )
+
+      render(<DirectoryPicker />)
+      await waitFor(() => expect(registeredPicker.current).not.toBeNull())
+
+      const promise = openPicker()
+
+      // Entries render — the browse succeeded against the Linux root.
+      await waitFor(() => expect(screen.getByText('home')).toBeInTheDocument())
+
+      // The browse targeted '/', NOT 'C:\' — the catalog (host OS) is the
+      // source of truth, not the client browser's navigator.platform.
+      const firstCall = String(mockFetch.mock.calls[0]?.[0] ?? '')
+      expect(firstCall).toContain('/fs/browse?path=')
+      expect(firstCall).toContain(encodeURIComponent('/'))
+      // 'C:' must NOT appear in the encoded query (would mean the Windows
+      // platform fallback was used instead of the catalog).
+      expect(firstCall).not.toMatch(/C%3A|C:\\/i)
+
+      fireEvent.click(screen.getByText('Cancel'))
+      await promise
+    })
+
+    it('opens at C:\\ when the catalog reports a Windows host', async () => {
+      mockListCatalog.mockResolvedValueOnce({
+        success: true,
+        data: {
+          host: {
+            os: 'windows',
+            arch: 'x86_64',
+            runtimes: { npx: true, uvx: false, node: true, bun: false, python3: false }
+          },
+          agents: []
+        }
+      })
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          success: true,
+          data: [dirEntry('Users', 'C:/Users')]
+        })
+      )
+
+      render(<DirectoryPicker />)
+      await waitFor(() => expect(registeredPicker.current).not.toBeNull())
+
+      const promise = openPicker()
+
+      await waitFor(() => expect(screen.getByText('Users')).toBeInTheDocument())
+
+      // The browse targeted the Windows drive root 'C:\'.
+      const firstCall = String(mockFetch.mock.calls[0]?.[0] ?? '')
+      expect(firstCall).toContain('/fs/browse?path=')
+      // The encoded path is 'C:\' (encoded as 'C%3A%5C' or 'C%3A\\').
+      expect(firstCall.toLowerCase()).toContain('c%3a')
+
+      fireEvent.click(screen.getByText('Cancel'))
+      await promise
+    })
+
+    it('falls back to navigator.platform when the catalog is unavailable (picker still opens)', async () => {
+      // Catalog fails — the picker must still open (graceful degrade).
+      mockListCatalog.mockResolvedValueOnce({
+        success: false,
+        error: 'catalog unavailable',
+        code: 'ACP_CATALOG_UNAVAILABLE'
+      })
+      // Windows platform fallback → 'C:\'.
+      stubPlatformWin32()
+      mockFetch.mockResolvedValueOnce(
+        jsonResponse({
+          success: true,
+          data: [dirEntry('Users', 'C:/Users')]
+        })
+      )
+
+      render(<DirectoryPicker />)
+      await waitFor(() => expect(registeredPicker.current).not.toBeNull())
+
+      const promise = openPicker()
+
+      await waitFor(() => expect(screen.getByText('Users')).toBeInTheDocument())
+
+      // The browse used the navigator.platform fallback ('C:\' on Windows),
+      // NOT '/' — proves the degrade path still seeds a non-empty root.
+      const firstCall = String(mockFetch.mock.calls[0]?.[0] ?? '')
+      expect(firstCall).toContain('/fs/browse?path=')
+      expect(firstCall.toLowerCase()).toContain('c%3a')
+
+      fireEvent.click(screen.getByText('Cancel'))
+      await promise
     })
   })
 

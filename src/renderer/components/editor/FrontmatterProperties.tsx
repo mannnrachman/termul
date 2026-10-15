@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import {
   Calendar,
   CircleDot,
@@ -12,8 +13,7 @@ import {
   Trash2,
   Type,
   X
-} from 'lucide-react'
-import { useCallback, useEffect, useId, useRef, useState } from 'react'
+} from '@/components/icons'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -201,7 +201,7 @@ export function FrontmatterProperties({
                   ) : (
                     <Input
                       id={fieldId}
-                      className="h-8 border-transparent bg-transparent px-2 shadow-none hover:border-input focus-visible:border-input"
+                      className="h-8 border-transparent bg-transparent px-2 shadow-none hover:border-input"
                       value={
                         draftScalars[key] !== undefined
                           ? draftScalars[key]

@@ -1,19 +1,14 @@
-import { AlertCircle, Check, Copy, Monitor, ShieldAlert } from 'lucide-react'
 import { QRCodeSVG } from 'qrcode.react'
 import { useEffect, useState } from 'react'
-import { toast } from 'sonner'
+import { AlertCircle, Check, Copy, Monitor, ShieldAlert } from '@/components/icons'
+import { STATUS_BAR_HIT_GLYPH, STATUS_BAR_HIT_TARGET } from '@/components/status-bar-hit'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Switch } from '@/components/ui/switch'
-import { toProjectSummaries } from '@/hooks/use-projects-persistence'
-import { toPersistedSessionSummaries } from '@/lib/acp-history-persistence'
-import { remoteServerApi, syncChatHistory, syncProjects } from '@/lib/api'
+import { remoteServerApi } from '@/lib/api'
 import { cn } from '@/lib/utils'
 import { useAcpStore } from '@/stores/acp-store'
 import { useProjectStore } from '@/stores/project-store'
 import { useRemoteStatus, useRemoteStatusStore } from '@/stores/remote-status-store'
-
-const statusBarTriggerClass =
-  'flex items-center hover:bg-white/10 px-2 py-0.5 rounded cursor-pointer transition-colors'
 
 /**
  * StatusBar popover for remote agent access.
@@ -52,45 +47,15 @@ export function RemoteAccessPopover(): React.JSX.Element {
       const result = enable ? await remoteServerApi.start() : await remoteServerApi.stop()
       if (result.success) {
         useRemoteStatusStore.getState().setStatus(result.data)
-        // Epic-4 bridge: seed the in-memory project registry so the web/remote
-        // client sees the desktop's project list immediately (the live-push
-        // path in `useProjectsAutoSave` keeps it in sync on later mutations).
-        // No env-var values cross the wire — redact-by-omission.
+        // The host registry is durable and the desktop reads it through the
+        // `projects` watch, so there is no project list to seed. Copy the
+        // desktop MCP servers to the active project's file (best-effort, interim
+        // bridge). Desktop-hosted browser history reads the durable Rust
+        // provider directly, so no renderer transcript seed is needed either.
         if (enable) {
-          const { projects, activeProjectId } = useProjectStore.getState()
-          // Await + inspect: a failed seed leaves the web client without a
-          // project list until the next desktop mutation re-syncs — surface it.
-          const syncResult = await syncProjects(
-            toProjectSummaries(projects, activeProjectId),
-            activeProjectId || null
-          )
-          if (!syncResult.success) {
-            toast.error(`Failed to seed remote project list: ${syncResult.error}`)
-          }
-          // Seed the chat-history cache (index + visible payloads) so the web
-          // sidebar shows the desktop's chats immediately (the live-push path
-          // in `useAcpHistorySync` + `persistSession` keeps it in sync).
-          // Await the session-index load first so the seed is not empty (the
-          // app-mount load in `useAcpHistory` may race with server-start).
-          await useAcpStore.getState().loadSessionIndex()
-          const { sessionIndex, messages } = useAcpStore.getState()
-          const payloads: Record<string, unknown> = {}
-          for (const entry of sessionIndex) {
-            if (entry.id in messages) {
-              payloads[entry.id] = { metadata: entry, messages: messages[entry.id] }
-            }
-          }
-          // Await + inspect (mirrors the projects seed above): a failed seed
-          // leaves the web sidebar empty until the live-push path in
-          // `useAcpHistorySync` + `persistSession` re-syncs — surface it.
-          // Remote access stays enabled; the live-push path recovers.
-          const chatResult = await syncChatHistory(
-            toPersistedSessionSummaries(sessionIndex),
-            Object.keys(payloads).length > 0 ? payloads : undefined
-          )
-          if (!chatResult.success) {
-            toast.error(`Failed to seed remote chat history: ${chatResult.error}`)
-          }
+          void useAcpStore
+            .getState()
+            .syncMcpRegistryToProjectFile(useProjectStore.getState().activeProjectId)
         }
       } else {
         setRemoteError(result.error)
@@ -118,11 +83,13 @@ export function RemoteAccessPopover(): React.JSX.Element {
       <PopoverTrigger asChild>
         <button
           type="button"
-          className={statusBarTriggerClass}
+          className={STATUS_BAR_HIT_TARGET}
           aria-label="Remote terminal access"
           aria-pressed={isRunning}
         >
-          <Monitor size={14} className={cn('mr-0', isRunning ? 'text-green-300' : undefined)} />
+          <span className={STATUS_BAR_HIT_GLYPH}>
+            <Monitor size={12} className={cn('shrink-0', isRunning && 'text-connection')} />
+          </span>
           {isRunning && <span className="sr-only">Remote access enabled</span>}
         </button>
       </PopoverTrigger>
@@ -161,15 +128,16 @@ export function RemoteAccessPopover(): React.JSX.Element {
             <div className="space-y-2">
               {/* White pad so the black QR modules are legible in dark themes. */}
               <div className="flex justify-center">
-                <div className="rounded-lg bg-white p-2">
+                <div className="rounded-lg bg-primary-foreground p-2">
                   <QRCodeSVG value={tunnelUrl} size={160} level="M" />
                 </div>
               </div>
-              <div className="flex items-start gap-2 text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2">
+              <div className="flex items-start gap-2 text-xs text-warning bg-warning/10 border border-warning/30 rounded-md px-3 py-2">
                 <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" />
                 <span>
-                  No auth yet — anyone with this link can drive your live agent. The link is random
-                  and shown only to you. Toggle off to rotate.
+                  This link carries your access token (after the #) — anyone who has it can drive
+                  your live agent, so share it only with devices you trust. The tunnel address is
+                  random and changes each time you toggle off and on.
                 </span>
               </div>
               <button

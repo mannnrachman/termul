@@ -15,14 +15,14 @@ sections_completed:
     'codebase_discovery_logging',
     'anti_patterns',
   ]
-status: 'complete'
+status: 'legacy_reference'
 rule_count: 76
-optimized_for_llm: true
+optimized_for_llm: false
 ---
 
-# Project Context for AI Agents
+# Legacy Project Context Reference
 
-_This file contains critical rules and patterns that AI agents must follow when implementing code in this project. Focus on unobvious details that agents might otherwise miss. Logging is mandatory when adding a feature; ADRs are recommended (not mandatory). For the dual-target (desktop ↔ termul-server) architecture and responsive web/mobile UI, see the Remote Parity and UI/Responsive sections._
+> Legacy/reference snapshot only. This document may contain stale versions, paths, and implementation details. Do not treat it as agent instructions or required preflight. The canonical repository instructions are in [`../AGENTS.md`](../AGENTS.md); verify technical facts against current source, manifests, and CI configuration.
 
 ---
 
@@ -34,12 +34,12 @@ _This file contains critical rules and patterns that AI agents must follow when 
 - **Language/tooling:** TypeScript `^7.0.2`, **strict** (`strict`, `noImplicitAny`, `isolatedModules`, `moduleResolution: bundler`, `jsx: react-jsx`, `noEmit`). ESM-first (`"type": "module"`).
 - **Build/test:** Vite `^8.0.14` (rolldown), Vitest `^4.1.6` with `jsdom ^27.4.0`, `@vitejs/plugin-react-swc`. Package manager **Bun** (`bun@1.3.1`).
 - **Linting/formatting:** **Biome `2.4.16`** — NOT ESLint. `bun run lint|check|format|ci`. (Only `landing/` ships an eslint config; the main app does not.)
-- **UI/state:** Tailwind CSS **v4** (`@tailwindcss/postcss ^4`, `@tailwindcss/typography`), Zustand `^5.0.9`, TanStack React Query `^5.83.0`, TanStack React Virtual `^3.14.9`, Radix UI + shadcn (`shadcn ^4.12.0` dev), `class-variance-authority`, `clsx`, `tailwind-merge`, `lucide-react`, `framer-motion ^12.25.0`.
+- **UI/state:** Tailwind CSS **v4** (`@tailwindcss/postcss ^4`, `@tailwindcss/typography`), Zustand `^5.0.9`, TanStack React Query `^5.83.0`, TanStack React Virtual `^3.14.9`, Radix UI + shadcn (`shadcn ^4.12.0` dev), `class-variance-authority`, `clsx`, `tailwind-merge`, `@hugeicons/react` + `@hugeicons/core-free-icons`, `framer-motion ^12.25.0`.
 - **Routing:** React Router DOM `^6.30.1` using **hash-router** patterns (both entries).
 - **Terminal stack:** `@xterm/xterm ^6.1.0-beta.216` (+ addon-fit/search/serialize/web-links/webgl beta), `tauri-pty ^0.1`; Rust `portable-pty 0.9`.
 - **Forms/validation:** React Hook Form `^7.61.1`, `@hookform/resolvers ^3.10.0`, Zod `^3.25.76`.
-- **ACP / AI:** `agent-client-protocol 0.12` (vendored 0.12.1 at `src-tauri/vendor/`), `tauri-plugin-mcp-bridge 0.9`, `ai ^7.0.4`, BlockNote `^0.46.2`, CodeMirror 6, streamdown `2.5.0`, mermaid `^11.14.0`.
-- **Remote server stack (Rust):** Axum `0.8` (ws), `tower-http 0.6` (cors/fs/trace), `rust-embed 8.12` (embeds `dist-web/`), `reqwest 0.13` (rustls), `tokio 1` (full), `parking_lot 0.12`, `keyring 3.6` (OS-native per target), `ssh2 0.9`.
+- **ACP / AI:** `agent-client-protocol 0.12` (vendored 0.12.1 at `src-tauri/vendor/`), `ai ^7.0.4`, BlockNote `^0.46.2`, CodeMirror 6, streamdown `2.5.0`, mermaid `^11.14.0`.
+- **Remote server stack (Rust):** Axum `0.8` (ws), `tower-http 0.6` (cors/fs/trace), `rust-embed 8.12` (embeds `dist-web/`), `reqwest 0.13` (rustls), `tokio 1` (full), `parking_lot 0.12`, `keyring 3.6` (OS-native per target), `russh 0.64` + `russh-sftp 3`.
 - **Logging:** `tauri-plugin-log 2` + `log 0.4` (desktop runtime) and `tracing 0.1` + `tracing-subscriber 0.3` (standalone server); `src-tauri/src/logging.rs` owns desktop setup, `server_main.rs` uses tracing. Renderer facade: `src/renderer/lib/log-api.ts`.
 - **Shell tests:** `bats ^1.13.0` (`bun run test:shell`); hooks via `husky ^9.1.7`.
 
@@ -84,13 +84,13 @@ _This file contains critical rules and patterns that AI agents must follow when 
 This project ships a **shared-live dual-target architecture**. The desktop app and the standalone `termul-server` share code — changes to one side MUST be checked against the other.
 
 - **Two binaries, one crate** (`termul_manager_lib`): desktop `src-tauri/src/main.rs` (`termul-manager`, `default-run`) and standalone `src-tauri/src/server_main.rs` (`termul-server`, feature `standalone-server`, path **outside** `src/bin/` so the Tauri bundler doesn't re-add it). The standalone is a **console** subsystem (no `windows_subsystem = "windows"`).
-- **Shared `web` module** (`src-tauri/src/web/`: `router.rs`, `ws.rs`, `fs_api.rs`, `project_registry.rs`, `projects_api.rs`, `config.rs`, `permissions.rs`, `chat_history_cache.rs`, `assets.rs`, `sink.rs`) is consumed by BOTH:
+- **Shared `web` module** (`src-tauri/src/web/`: `router.rs`, `ws.rs`, `fs_api.rs`, `project_registry.rs`, `projects_api.rs`, `config.rs`, `permissions.rs`, `chat_history_cache.rs`, `assets.rs`, `sink/`) is consumed by BOTH:
   - Desktop in-process via `web::serve_router` (driven by `remote/host.rs` `RemoteServerState`) — **never kills agents**.
   - Standalone via `web::serve` (in `server_main.rs`) — **calls `AcpManager::kill_all` after Axum drains**.
   - ⚠️ **Kill-all hazard:** the desktop shared-live path MUST use `serve_router` (never `serve`). Stopping the shared-live server must NOT kill the desktop's live agents.
 - **Shared `dist-web` bundle** is built by `vite.config.web.ts` (entry `App.tsx`, `TERMUL_WEB` gate, `@tauri-apps/*` → stubs) and embedded into the binary via `rust-embed`. `tauri.conf.json` `beforeBuildCommand` builds `dist-web` **then** `dist-tauri`. Served by BOTH the desktop in-process server and the standalone server.
 - **Shared `IpcResult<T>` contract** (`src-tauri/src/commands.rs`, `IpcResult.success/error`) is the body shape for **both Tauri commands and web routes** (`web/fs_api.rs` `IpcBody<T>`). Renderer facades return the same shape; transport failures map to `{ success: false, code: 'NETWORK_ERROR' }`. Changing any command/result/route shape MUST update all three: the Tauri command, the `web/*` route, and the renderer facade.
-- **Shared `AcpManager` + `WsRelaySink` + `PermissionRendezvous`**: desktop resolves permissions via the `acp_respond_permission` Tauri command directly; standalone uses `/ws respond_permission` + the rendezvous (first-response-wins, disconnect-deny, TOCTOU-safe). Permission-flow changes must update both paths.
+- **Shared `AcpManager` + `WsRelaySink` + `PermissionRendezvous`**: every `/ws` client (the desktop renderer over its Tauri channel, a phone, a browser) answers permissions through `/ws respond_permission` + the rendezvous (first-response-wins, TOCTOU-safe, durable: no ticket timeout and no disconnect deny; a ticket ends only by an answer, turn end, session close or agent death).
 - **Renderer facade parity** (`src/renderer/lib/web-server-api.ts` + `tauri-runtime.ts`): when `!isTauriContext()`, facades swap to HTTP impls hitting `web/router.rs` routes. A new Tauri command exposed to UI must get an **equivalent web route + facade**, or be explicitly desktop-only-gated. Do not ship a Tauri command that breaks web parity without an ADR-acknowledged reason.
 - **Remote exposure**: `src-tauri/src/remote/host.rs` (in-process shared-live, `RemoteBindMode::Localhost|All`) + `remote/cloudflared.rs` (tunnel). `remote_server_start/stop/status` are Tauri commands. LAN exposure is an explicit operator decision; auth/token-gating is not yet complete — don't assume it.
 - **Mandatory parity check:** whenever you change desktop runtime/command/IPC/event/contract behavior, open the matching `src-tauri/src/web/` route, `server_main.rs` path, and renderer facade, and update all sides. Add a regression test for both desktop and web paths where feasible.
@@ -147,7 +147,7 @@ This project ships a **shared-live dual-target architecture**. The desktop app a
 - **Logging is mandatory when adding a feature or flow** — it is the primary maintainability/debuggability surface (issue #244). The stack differs per target; use the right one:
   - **Desktop Rust runtime**: emit via the `log` facade (`log::info!`/`warn!`/`error!`/`debug!`). Routed by `tauri-plugin-log` (`src-tauri/src/logging.rs`) to `<app_log_dir>/termul.log` (rotated, KeepOne, 5MB) + stdout in debug. Levels via `RUST_LOG` (floor `info` release / `debug` debug; per-module overrides supported). A global panic hook and per-process `session_id()` (8-char) already exist — reuse `session_id()` for correlation-worthy lines.
   - **Standalone `termul-server`**: uses `tracing` + `tracing-subscriber` (`EnvFilter`, `RUST_LOG`) initialized in `server_main.rs`. Use `tracing::info!`/`warn!`/`error!` (NOT the `log` facade) on this path.
-  - **Renderer**: import from `src/renderer/lib/log-api.ts` (`logFrontendError`, `installGlobalErrorForwarding`), which forwards to the backend log via the `log_frontend_error` Tauri command and never throws. Prefer it over raw `console.*` for errors/warnings that must survive a closed DevTools. (This facade is desktop-only; the web client has no error-forwarding to the backend yet — a parity gap to be aware of, not a reason to sprinkle `console.log`.)
+  - **Renderer**: import from `src/renderer/lib/log-api.ts` (`logFrontendError`, `installGlobalErrorForwarding`), which forwards to the backend log via the `log_frontend_error` Tauri command (desktop) or `POST /log/frontend-error` (web/remote mode) and never throws. Prefer it over raw `console.*` for errors/warnings that must survive a closed DevTools.
   - **What to log**: meaningful boundaries — operation start, success, and especially failure (with context: ids, paths, offending input/error). Errors must be logged, never swallowed silently. Levels: `info` normal ops, `warn` recoverable degradation, `error` failures, `debug`/`trace` dev-only detail. Never log secrets/credentials (keyring values, tokens, env contents).
   - Reuse existing helpers for new runtime entrypoints: `logging::log_startup_banner`, `logging::install_panic_hook`, `logging::session_id`, `logging::log_file_path`.
 - **ADRs (recommended, not mandatory):** for significant architectural decisions, record an ADR in `docs/adr/` (ADR-001…005 exist) using the `Status / Date / Author / Context / Background / Architecture / Consequences` format, and register it in `docs/adr/README.md`. The `manage_adr` MCP tool can create/update them. Validate against the live codebase (see ADR-003's "Validation note" pattern).
@@ -174,32 +174,6 @@ This project ships a **shared-live dual-target architecture**. The desktop app a
 
 ---
 
-## Usage Guidelines
+## Legacy status
 
-### Preflight Checklist
-
-1. Read this file before implementing any code.
-2. Decide whether the change belongs in `src/renderer/`, `src/shared/`, or `src-tauri/` (and if `src-tauri/`, whether it affects the shared `web/` module or `server_main.rs`).
-3. Respect the Tauri-first + shared-live architecture; do not reintroduce Electron-era patterns.
-4. Use the codebase-memory MCP graph (`search_graph` → `trace_path` → `get_code_snippet`) to understand existing code before writing.
-5. Keep native/plugin access behind `src/renderer/lib/tauri-*.ts` facades (Biome-enforced); add web-mode fallbacks for new facades.
-6. Check desktop↔`termul-server` parity: update the Tauri command, the `web/*` route, and the renderer facade together; mind the kill-all split (`serve_router` vs `serve`).
-7. Make UI responsive/mobile-friendly and `isTauriContext()`-gated; don't assume native chrome.
-8. Follow strict TypeScript + Biome rules (no semicolons, single quotes, no trailing commas, 2-space, lineWidth 100).
-9. Add colocated `*.test.ts` / `*.test.tsx` (Vitest + jsdom); for server changes, test the route + `IpcResult` contract.
-10. Add structured logs for any new feature/flow — Rust desktop via the `log` facade, `termul-server` via `tracing`, renderer via `src/renderer/lib/log-api.ts` (not raw `console.*`). Log failures with context; never swallow errors silently. (ADRs recommended for significant architectural changes — `docs/adr/`.)
-11. Run `bun run lint`, `bun run typecheck`, `bun run test`, and `cd src-tauri && cargo clippy --all-targets -- -D warnings && cargo test` before considering the change complete.
-
-**For AI Agents:**
-
-- Read this file before implementing any code. Follow all rules exactly as documented.
-- Prefer the more restrictive option when in doubt.
-- Use the codebase-memory MCP graph for discovery; update this file if new patterns emerge.
-
-**For Humans:**
-
-- Keep this file lean and focused on agent needs. Update when the stack or architecture changes.
-- Review quarterly for outdated rules. Remove rules that become obvious over time.
-- Re-index the codebase-memory MCP graph when structure changes materially; discover the project key via `list_projects` / `index_status` (it is machine-specific).
-
-Last Updated: 2026-07-19
+This file is retained for historical architecture and migration context. It is not an instruction source and is not maintained as a current stack, CI, or repository-policy inventory. Use `../AGENTS.md` for current agent instructions and `index.md` to locate deeper documentation.

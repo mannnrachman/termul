@@ -1,21 +1,21 @@
-// Context bar visibility settings
+﻿// Context bar visibility settings
 export interface ContextBarSettings {
+  showProjectName: boolean
   showGitBranch: boolean
   showGitStatus: boolean
   showWorkingDirectory: boolean
   showExitCode: boolean
 }
 
-// Default settings with all elements visible
+// Default settings for users with no saved blob: project name and file counts
+// (`showGitStatus`) are hidden; branch, directory and exit code are shown.
 export const DEFAULT_CONTEXT_BAR_SETTINGS: ContextBarSettings = {
+  showProjectName: false,
   showGitBranch: true,
-  showGitStatus: true,
+  showGitStatus: false,
   showWorkingDirectory: true,
   showExitCode: true
 }
-
-// Persistence key for context bar settings
-export const CONTEXT_BAR_SETTINGS_KEY = 'settings/context-bar'
 
 // Table of contents panel settings
 export interface TocSettings {
@@ -24,16 +24,16 @@ export interface TocSettings {
   width: number
 }
 
-export const TOC_MIN_WIDTH = 150
-export const TOC_MAX_WIDTH = 350
+export const TOC_MIN_WIDTH = 180
+export const TOC_MAX_WIDTH = 360
+/** Below this editor-pane width the outline folds into a tick strip. */
+export const TOC_NARROW_PANE_WIDTH = 720
 
 export const DEFAULT_TOC_SETTINGS: TocSettings = {
   isVisible: true,
   maxHeadingLevel: 3,
-  width: 220
+  width: 240
 }
-
-export const TOC_SETTINGS_KEY = 'settings/toc'
 
 export type TerminalUrlOpenMode = 'system' | 'termul'
 
@@ -46,16 +46,11 @@ export interface AppSettings {
   terminalFontSize: number
   terminalBufferSize: number // Scrollback buffer size in lines
   terminalRenderer: 'auto' | 'webgl' | 'dom'
+  terminalScreenReaderMode: boolean // xterm screenReaderMode for new terminals (off by default)
   defaultShell: string
   defaultProjectColor: string // Default color for new projects (from PROJECT_COLORS)
-  maxTerminalsPerProject: number // Maximum terminals allowed per project
-  orphanDetectionEnabled: boolean // Enable automatic cleanup of inactive terminals
-  orphanDetectionTimeout: number | null // Timeout in ms, null = disabled
   confirmTerminalClose: boolean // Show a confirmation dialog before closing a terminal
   terminalUrlOpenMode: TerminalUrlOpenMode // Controls how Ctrl/Cmd+Click terminal URLs are opened
-  sidebarVisible: boolean
-  fileExplorerVisible: boolean
-  sshPanelVisible: boolean
   /** Remote server bind: localhost (127.0.0.1) or all interfaces (0.0.0.0). */
   remoteBindMode: RemoteBindMode
   /** App-wide color theme family id (without `-light` suffix). */
@@ -64,20 +59,43 @@ export interface AppSettings {
   appearanceMode: 'light' | 'dark'
   /** Whole-UI zoom factor (1.0 = 100%). Scales the entire window like VS Code's window zoom. */
   uiZoomLevel: number
+  /** ACP turn hard-cap timeout in seconds, or null = use the env var / Rust
+   * default (unlimited by default). Set via App Preferences; pushed to the
+   * Rust core. */
+  acpTurnTimeoutSecs: number | null
+  /** Automatically save dirty editor files after edits pause (GH-539). */
+  editorAutoSave: boolean
+  /** Idle delay in ms before a dirty editor file is auto-saved (GH-539). */
+  editorAutoSaveDelayMs: number
+  /** ACP per-turn idle timeout in seconds, or null = use the env var / Rust
+   * default (unlimited by default). Set via App Preferences; pushed to the
+   * Rust core. */
+  acpTurnIdleTimeoutSecs: number | null
+  /** ACP session/new timeout in seconds, or null = use the env var / Rust
+   * default (60s). Set via App Preferences; pushed to the Rust core. */
+  acpSessionNewTimeoutSecs: number | null
+  /** ACP session reopen (load/resume) timeout in seconds, or null = use the
+   * env var / Rust default (60s). Set via App Preferences; pushed to the
+   * Rust core. */
+  acpSessionReopenTimeoutSecs: number | null
+  /**
+   * OS/web notification when a terminal tab that was producing output for a
+   * long stretch (typically an in-terminal AI harness) goes idle (GH-645).
+   */
+  notifyOnTerminalIdle: boolean
+  /** OS/web notification when an Agent Chat turn finishes (issue #865). */
+  notifyOnAgentChatTurnFinished: boolean
+  /** OS/web notification when an Agent Chat waits for approval or a question. */
+  notifyOnAgentChatNeedsYou: boolean
 }
 
-/** Whole-UI zoom bounds — match the native View menu semantics (0.5x–3.0x, 10% steps). */
+/** Whole-UI zoom bounds â€” match the native View menu semantics (0.5xâ€“3.0x, 10% steps). */
 export const UI_ZOOM_DEFAULT = 1.0
 export const UI_ZOOM_MIN = 0.5
 export const UI_ZOOM_MAX = 3.0
 export const UI_ZOOM_STEP = 0.1
 
-export type AppPanelVisibilitySettingKey =
-  | 'sidebarVisible'
-  | 'fileExplorerVisible'
-  | 'sshPanelVisible'
-
-export type AppSettingsUpdate = Partial<Omit<AppSettings, AppPanelVisibilitySettingKey>>
+export type AppSettingsUpdate = Partial<AppSettings>
 
 // Terminal buffer size options
 export const BUFFER_SIZE_OPTIONS = [
@@ -99,22 +117,12 @@ export const FONT_FAMILY_OPTIONS = [
   { value: '"Fira Code", Menlo, monospace', label: 'Fira Code' }
 ]
 
-// Max terminals per project options
-export const MAX_TERMINALS_OPTIONS = [
-  { value: 5, label: '5 terminals' },
-  { value: 10, label: '10 terminals' },
-  { value: 15, label: '15 terminals' },
-  { value: 20, label: '20 terminals' },
-  { value: 50, label: '50 terminals' }
-]
-
-// Orphan detection timeout options
-export const ORPHAN_TIMEOUT_OPTIONS = [
-  { value: 60000, label: '1 minute' },
-  { value: 300000, label: '5 minutes' },
-  { value: 600000, label: '10 minutes' },
-  { value: 1800000, label: '30 minutes' },
-  { value: 3600000, label: '1 hour' }
+// Editor auto-save delay options (GH-539)
+export const EDITOR_AUTO_SAVE_DELAY_OPTIONS = [
+  { value: 500, label: '0.5 seconds' },
+  { value: 1000, label: '1 second' },
+  { value: 2000, label: '2 seconds' },
+  { value: 5000, label: '5 seconds' }
 ]
 
 // Terminal renderer strategy options
@@ -150,30 +158,92 @@ export const REMOTE_BIND_MODE_OPTIONS: Array<{
   }
 ]
 
+// ACP turn (hard-cap) timeout options for the App Preferences UI. `null` =
+// follow the env var / Rust default (unlimited); a number is the override in
+// seconds.
+export const ACP_TURN_TIMEOUT_OPTIONS: Array<{
+  value: number | null
+  label: string
+}> = [
+  { value: null, label: 'Environment/default (unlimited)' },
+  { value: 3600, label: '1 hour' },
+  { value: 7200, label: '2 hours' },
+  { value: 21600, label: '6 hours' },
+  { value: 86400, label: '24 hours' },
+  { value: 31536000, label: '1 year' }
+]
+
+// ACP turn idle-timeout options (the silent-turn window). `null` = follow the
+// env var / Rust default (unlimited); a number is the override in seconds.
+export const ACP_TURN_IDLE_TIMEOUT_OPTIONS: Array<{
+  value: number | null
+  label: string
+}> = [
+  { value: null, label: 'Environment/default (unlimited)' },
+  { value: 300, label: '5 minutes' },
+  { value: 600, label: '10 minutes' },
+  { value: 900, label: '15 minutes' },
+  { value: 1800, label: '30 minutes' },
+  { value: 3600, label: '1 hour' }
+]
+
+// ACP session/new timeout options. `null` = follow the env var / Rust default
+// (60 seconds); a number is the override in seconds.
+export const ACP_SESSION_NEW_TIMEOUT_OPTIONS: Array<{
+  value: number | null
+  label: string
+}> = [
+  { value: null, label: 'Environment/default (60 seconds)' },
+  { value: 30, label: '30 seconds' },
+  { value: 60, label: '1 minute' },
+  { value: 120, label: '2 minutes' },
+  { value: 300, label: '5 minutes' }
+]
+
+// ACP session reopen (load/resume) timeout options. `null` = follow the env
+// var / Rust default (60 seconds); a number is the override in seconds.
+export const ACP_SESSION_REOPEN_TIMEOUT_OPTIONS: Array<{
+  value: number | null
+  label: string
+}> = [
+  { value: null, label: 'Environment/default (60 seconds)' },
+  { value: 30, label: '30 seconds' },
+  { value: 60, label: '1 minute' },
+  { value: 120, label: '2 minutes' },
+  { value: 300, label: '5 minutes' }
+]
+
 // Default application settings
 export const DEFAULT_APP_SETTINGS: AppSettings = {
-  terminalFontFamily: 'Menlo, Monaco, "Courier New", monospace',
+  // Terminal font default — the same JetBrains Mono Variable stack as
+  // DEFAULT_TERMINAL_OPTIONS.fontFamily in terminal-config.ts (the canonical
+  // stack). The bundled webfont exists on mobile browsers (CAP-9), unlike the
+  // old Menlo/Monaco/Courier stack which silently fell back to a generic
+  // system monospace there.
+  terminalFontFamily:
+    '"JetBrains Mono Variable", "JetBrains Mono", "Cascadia Code", "SF Mono", Menlo, Monaco, Consolas, "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace',
   terminalFontSize: 14,
   terminalBufferSize: 10000,
-  terminalRenderer: 'webgl',
+  terminalRenderer: 'auto',
+  terminalScreenReaderMode: false,
   defaultShell: '',
   defaultProjectColor: 'blue',
-  maxTerminalsPerProject: 10,
-  orphanDetectionEnabled: true,
-  orphanDetectionTimeout: 600000, // 10 minutes
   confirmTerminalClose: true,
   terminalUrlOpenMode: 'system',
-  sidebarVisible: true,
-  fileExplorerVisible: true,
-  sshPanelVisible: true,
   remoteBindMode: 'localhost',
   colorTheme: 'termul',
   appearanceMode: 'dark',
-  uiZoomLevel: UI_ZOOM_DEFAULT
+  uiZoomLevel: UI_ZOOM_DEFAULT,
+  acpTurnTimeoutSecs: null,
+  editorAutoSave: false,
+  editorAutoSaveDelayMs: 1000,
+  acpTurnIdleTimeoutSecs: null,
+  acpSessionNewTimeoutSecs: null,
+  acpSessionReopenTimeoutSecs: null,
+  notifyOnTerminalIdle: true,
+  notifyOnAgentChatTurnFinished: true,
+  notifyOnAgentChatNeedsYou: true
 }
-
-// Persistence key for app settings
-export const APP_SETTINGS_KEY = 'settings/app'
 
 // Keyboard shortcut definition
 export interface KeyboardShortcut {
@@ -263,8 +333,8 @@ export const DEFAULT_KEYBOARD_SHORTCUTS: KeyboardShortcutsConfig = {
   },
   sidebarToggle: {
     id: 'sidebarToggle',
-    label: 'Toggle Sidebar',
-    description: 'Show or hide the project sidebar',
+    label: 'Toggle Projects',
+    description: 'Expand or collapse projects',
     defaultKey: 'ctrl+shift+b'
   },
   closeTab: {
@@ -281,8 +351,8 @@ export const DEFAULT_KEYBOARD_SHORTCUTS: KeyboardShortcutsConfig = {
   },
   toggleFileExplorer: {
     id: 'toggleFileExplorer',
-    label: 'Toggle File Explorer',
-    description: 'Show or hide the file explorer panel',
+    label: 'Toggle Side Panel',
+    description: 'Show or hide side panel',
     defaultKey: 'ctrl+b'
   },
   fileExplorerRename: {
@@ -309,13 +379,13 @@ export const DEFAULT_KEYBOARD_SHORTCUTS: KeyboardShortcutsConfig = {
     id: 'worktreeSwitchNext',
     label: 'Switch to Next Worktree',
     description: 'Cycle to the next worktree in the sidebar',
-    defaultKey: 'ctrl+shift+downarrow'
+    defaultKey: 'ctrl+shift+arrowdown'
   },
   worktreeSwitchPrev: {
     id: 'worktreeSwitchPrev',
     label: 'Switch to Previous Worktree',
     description: 'Cycle to the previous worktree in the sidebar',
-    defaultKey: 'ctrl+shift+uparrow'
+    defaultKey: 'ctrl+shift+arrowup'
   },
   worktreeOpenTerminal: {
     id: 'worktreeOpenTerminal',
@@ -352,8 +422,53 @@ export const DEFAULT_KEYBOARD_SHORTCUTS: KeyboardShortcutsConfig = {
     label: 'Change Color Theme',
     description: 'Open the color theme picker with live preview',
     defaultKey: 'ctrl+alt+t'
+  },
+  settings: {
+    id: 'settings',
+    label: 'Settings',
+    description: 'Open app settings',
+    defaultKey: 'ctrl+,'
   }
 }
 
-// Persistence key for keyboard shortcuts
-export const KEYBOARD_SHORTCUTS_KEY = 'settings/keyboard-shortcuts'
+/**
+ * Web-client default-key overrides (issue #858).
+ *
+ * Chrome/Edge/Firefox reserve `ctrl+n` (new window), `ctrl+t` (new tab),
+ * `ctrl+w` (close tab), `ctrl+shift+n` (incognito), `ctrl+pageup/pagedown`
+ * (tab cycling) and `ctrl+r` (reload) in a normal tab — the web app cannot
+ * intercept them (only an installed PWA can). `ctrl+=/-/0` are the browser
+ * zoom keys. The web defaults swap these to Alt-based (or unbound) combos;
+ * user `customKey`s still win over both default sets.
+ */
+const WEB_DEFAULT_KEY_OVERRIDES: Record<string, string> = {
+  newProject: 'alt+n',
+  newTerminal: 'alt+t',
+  newBrowserTab: 'alt+shift+n',
+  closeTab: 'alt+w',
+  nextTerminal: 'alt+pagedown',
+  prevTerminal: 'alt+pageup',
+  // Ctrl+R is the browser reload key: don't bind a default on web at all
+  // (empty string never matches a normalized event).
+  commandHistory: '',
+  zoomIn: 'alt+=',
+  zoomOut: 'alt+-',
+  zoomReset: 'alt+0',
+  settings: 'alt+,'
+}
+
+/** Platform-aware default bindings. See `WEB_DEFAULT_KEY_OVERRIDES`. */
+export function getDefaultKeyboardShortcuts(): KeyboardShortcutsConfig {
+  const isTauri =
+    typeof window !== 'undefined' &&
+    typeof (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ !== 'undefined'
+  if (isTauri) return DEFAULT_KEYBOARD_SHORTCUTS
+
+  const webDefaults: KeyboardShortcutsConfig = {}
+  for (const [key, shortcut] of Object.entries(DEFAULT_KEYBOARD_SHORTCUTS)) {
+    const override = WEB_DEFAULT_KEY_OVERRIDES[key]
+    webDefaults[key] =
+      override === undefined ? { ...shortcut } : { ...shortcut, defaultKey: override }
+  }
+  return webDefaults
+}
