@@ -202,6 +202,12 @@ impl Default for ClientId {
     }
 }
 
+impl std::fmt::Display for ClientId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 impl WsRelaySink {
     /// Fan one just-assigned event out to every subscriber of `sid`. Runs
     /// inside the publish critical section (`sessions` held): lock order
@@ -408,6 +414,14 @@ impl EventSink for WsRelaySink {
                 if matches!(type_, "prompt_complete" | "session_closed") {
                     self.release_session_tickets(sid);
                 }
+                // Issue #784: one question withdrawn while its turn goes on.
+                if type_ == "question_cancelled" {
+                    if let Some(question_id) =
+                        event.payload.get("questionId").and_then(Value::as_str)
+                    {
+                        self.release_question_ticket(question_id);
+                    }
+                }
                 // Session-scoped: assign seq, persist, append and fan out in
                 // one critical section.
                 self.publish(sid, type_, event.payload.clone(), tier);
@@ -507,7 +521,14 @@ impl EventSink for WsRelaySink {
                         .get("options")
                         .cloned()
                         .unwrap_or(Value::Array(vec![]));
-                    rdz.register(question_id, agent_id, session_id, options);
+                    let allow_free_text = payload
+                        .get("allowFreeText")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    rdz.register(question_id.clone(), agent_id, session_id, options);
+                    if allow_free_text {
+                        rdz.allow_free_text(&question_id);
+                    }
                 }
             }
         }

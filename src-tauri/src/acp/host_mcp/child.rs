@@ -13,15 +13,25 @@
 //! to the agent. Minimal runtime: no Tauri plugins, no `AppHandle`, no sinks —
 //! works identically on desktop + standalone.
 
+use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
+use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::service::serve_server;
-use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use rmcp::model::{
+    GetPromptRequestParams, GetPromptResponse, GetPromptResult, ListPromptsResult,
+    ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Tool,
+};
+use rmcp::service::{serve_server, RequestContext};
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
+use crate::acp::host_mcp::canvas_tools;
 use crate::acp::host_mcp::{
-    FrameKind, FrameReply, FrameRequest, TermulBrowserInput, TermulPlanInput, TermulSetTitleInput,
-    ENV_AGENT_ID, ENV_PORT, ENV_SESSION_ID, ENV_TOKEN, TERMUL_CHAT_INSTRUCTIONS,
+    session_instructions, FrameKind, FrameReply, FrameRequest, TermulAskUserInput,
+    TermulBrowserInput, TermulPlanInput, TermulSetTitleInput, ENV_AGENT_ID, ENV_PORT,
+    ENV_SESSION_ID, ENV_TOKEN,
 };
 
 /// Env-derived configuration for the child. Extracted so the arg parser is
@@ -100,6 +110,32 @@ pub fn run() -> i32 {
 /// fresh TCP connection to the parent.
 struct TermulPlanServer {
     config: ChildConfig,
+    /// The host tools plus figcraft's canvas tools, present from session start
+    /// whether or not a canvas is open.
+    tools: ToolRouter<Self>,
+}
+
+impl TermulPlanServer {
+    fn new(config: ChildConfig) -> Self {
+        let mut tools = Self::tool_router();
+        for tool in canvas_tools::tools() {
+            tools.add_route(canvas_route(tool));
+        }
+        Self { config, tools }
+    }
+}
+
+fn canvas_route(tool: Tool) -> ToolRoute<TermulPlanServer> {
+    ToolRoute::new_dyn(tool, |context: ToolCallContext<'_, TermulPlanServer>| {
+        let config = context.service.config.clone();
+        let name = context.name.to_string();
+        let arguments = context.arguments.map_or(Value::Null, Value::Object);
+        Box::pin(async move {
+            Ok(canvas_tools::call_tool(config, name, arguments)
+                .await
+                .into())
+        })
+    })
 }
 
 /// rmcp derives the `tools/list` entry from the `#[tool]` attribute; the input
@@ -108,9 +144,9 @@ struct TermulPlanServer {
 /// `host_mcp::mod`) — it already derives `JsonSchema`.
 ///
 /// The `ServerHandler` impl lives in its own block below (not the
-/// `server_handler` flag) so `get_info` can attach `TERMUL_CHAT_INSTRUCTIONS`
+/// `server_handler` flag) so `get_info` can attach `session_instructions()`
 /// to the `initialize` result — the channel that advertises the chat
-/// renderer's markdown image + open-in-editor affordances to the agent.
+/// renderer's markdown affordances and the design canvas to the agent.
 #[tool_router]
 impl TermulPlanServer {
     #[tool(
@@ -128,6 +164,10 @@ impl TermulPlanServer {
             browser_action: None,
             browser_args: None,
             browser_element: None,
+            ask: None,
+            canvas_method: None,
+            canvas_params: None,
+            canvas_tool: None,
         };
         match forward_to_parent(&self.config, request, "plan updated").await {
             Ok(msg) => msg,
@@ -150,6 +190,10 @@ impl TermulPlanServer {
             browser_action: Some(input.action),
             browser_args: Some(input.args),
             browser_element: input.element,
+            ask: None,
+            canvas_method: None,
+            canvas_params: None,
+            canvas_tool: None,
         };
         match forward_to_parent_raw(&self.config, request).await {
             Ok(reply) if reply.ok => reply
@@ -188,10 +232,60 @@ impl TermulPlanServer {
             browser_action: None,
             browser_args: None,
             browser_element: None,
+            ask: None,
+            canvas_method: None,
+            canvas_params: None,
+            canvas_tool: None,
         };
         match forward_to_parent(&self.config, request, "title updated").await {
             Ok(msg) => msg,
             Err(e) => format!("set_session_title error: {e}"),
+        }
+    }
+
+    #[tool(
+        name = "ask_user",
+        description = "Ask the user a question and wait for the answer. Use this INSTEAD of asking in plain text whenever you need a decision, a preference or missing details: the question appears as a panel in Termul and this call returns the answer. Pass `options` (label and optional description) for choices, `multi_select` to allow several picks, and `allow_free_text` (default true) to let the user type their own answer. The result is JSON: {\"answers\": [...], \"free_text\": string or null, \"cancelled\": boolean}. When cancelled is true the user dismissed the question; do not ask again unless you need the answer to continue."
+    )]
+    async fn ask_user(
+        &self,
+        Parameters(input): Parameters<TermulAskUserInput>,
+        cancelled: tokio_util::sync::CancellationToken,
+    ) -> String {
+        let request = FrameRequest {
+            token: self.config.token.clone(),
+            session_id: self.config.session_id.clone(),
+            kind: FrameKind::AskUser,
+            todos: Vec::new(),
+            title: None,
+            branch: None,
+            browser_action: None,
+            browser_args: None,
+            browser_element: None,
+            ask: Some(input),
+            canvas_method: None,
+            canvas_params: None,
+            canvas_tool: None,
+        };
+        // No client-side timeout: the user decides when to answer, and the
+        // parent always resolves the call (answer, cancel, or session end).
+        // rmcp only signals a client cancel (a tool timeout, an abort) and
+        // keeps polling this future, so hang up on the parent ourselves: that
+        // is how it learns to take the question down.
+        let reply = tokio::select! {
+            reply = exchange_frame(&self.config, request) => reply,
+            () = cancelled.cancelled() => return "ask_user cancelled by the client".to_string(),
+        };
+        match reply {
+            Ok(reply) if reply.ok => reply
+                .result
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "{}".to_string()),
+            Ok(reply) => format!(
+                "ask_user error: {}",
+                reply.error.unwrap_or_else(|| "unknown".to_string())
+            ),
+            Err(e) => format!("ask_user transport error: {e}"),
         }
     }
 }
@@ -199,16 +293,65 @@ impl TermulPlanServer {
 /// `#[tool_handler]` fills `call_tool`/`list_tools`/`get_tool` from the router
 /// and skips `get_info` because it is provided here: the returned
 /// `instructions` land in the MCP `initialize` result so agents learn they can
-/// embed images in markdown replies and link files for open-in-editor.
-#[tool_handler]
+/// embed images, link files for open-in-editor, and design on the canvas.
+/// Resources and prompts are figcraft's, answered by `canvas_tools`.
+#[tool_handler(router = self.tools)]
 impl ServerHandler for TermulPlanServer {
     fn get_info(&self) -> rmcp::model::ServerConfig {
         rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
+                .enable_resources()
+                .enable_prompts()
                 .build(),
         )
-        .with_instructions(TERMUL_CHAT_INSTRUCTIONS.to_string())
+        .with_instructions(session_instructions())
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        canvas_tools::request(self.config.clone(), "resources/list", json!({})).await
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourceTemplatesResult, ErrorData> {
+        canvas_tools::request(self.config.clone(), "resources/templates/list", json!({})).await
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        let params = json!({ "uri": request.uri });
+        canvas_tools::request::<ReadResourceResult>(self.config.clone(), "resources/read", params)
+            .await
+            .map(Into::into)
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListPromptsResult, ErrorData> {
+        canvas_tools::request(self.config.clone(), "prompts/list", json!({})).await
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<GetPromptResponse, ErrorData> {
+        let params = json!({ "name": request.name, "arguments": request.arguments });
+        canvas_tools::request::<GetPromptResult>(self.config.clone(), "prompts/get", params)
+            .await
+            .map(Into::into)
     }
 }
 
@@ -240,28 +383,32 @@ async fn forward_to_parent_raw(
     request: FrameRequest,
 ) -> Result<FrameReply, String> {
     const BROWSER_ROUND_TRIP: std::time::Duration = std::time::Duration::from_secs(150);
-    tokio::time::timeout(BROWSER_ROUND_TRIP, async move {
-        let mut stream = TcpStream::connect(("127.0.0.1", config.port))
-            .await
-            .map_err(|e| format!("connect to parent failed: {e}"))?;
-        let mut buf = serde_json::to_vec(&request).map_err(|e| format!("encode frame: {e}"))?;
-        buf.push(b'\n');
-        stream
-            .write_all(&buf)
-            .await
-            .map_err(|e| format!("write frame: {e}"))?;
-        // Snapshot payloads are large; keep the cap generous.
-        const MAX_REPLY: u64 = 1024 * 1024;
-        let mut reader = BufReader::new(stream.take(MAX_REPLY));
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .map_err(|e| format!("read reply: {e}"))?;
-        serde_json::from_str(&line).map_err(|e| format!("decode reply: {e}"))
-    })
-    .await
-    .map_err(|_| "parent round trip timed out".to_string())?
+    tokio::time::timeout(BROWSER_ROUND_TRIP, exchange_frame(config, request))
+        .await
+        .map_err(|_| "parent round trip timed out".to_string())?
+}
+
+/// Send one frame to the parent and read its reply, with no timeout of its
+/// own. Callers bound it when the parent is expected to answer promptly.
+async fn exchange_frame(config: &ChildConfig, request: FrameRequest) -> Result<FrameReply, String> {
+    let mut stream = TcpStream::connect(("127.0.0.1", config.port))
+        .await
+        .map_err(|e| format!("connect to parent failed: {e}"))?;
+    let mut buf = serde_json::to_vec(&request).map_err(|e| format!("encode frame: {e}"))?;
+    buf.push(b'\n');
+    stream
+        .write_all(&buf)
+        .await
+        .map_err(|e| format!("write frame: {e}"))?;
+    // Snapshot payloads are large; keep the cap generous.
+    const MAX_REPLY: u64 = 1024 * 1024;
+    let mut reader = BufReader::new(stream.take(MAX_REPLY));
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .await
+        .map_err(|e| format!("read reply: {e}"))?;
+    serde_json::from_str(&line).map_err(|e| format!("decode reply: {e}"))
 }
 
 async fn forward_to_parent_inner(
@@ -321,7 +468,7 @@ where
     tokio::spawn(async move {
         let _ = copy_with_discover_meta(stdin, shim_side).await;
     });
-    let service = TermulPlanServer { config };
+    let service = TermulPlanServer::new(config);
     let running = serve_server(service, (server_read, stdout))
         .await
         .map_err(|e| format!("mcp server initialize failed: {e}"))?;

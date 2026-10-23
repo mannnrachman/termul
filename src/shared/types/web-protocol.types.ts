@@ -176,6 +176,10 @@ export const WS_REQUEST_TYPES = [
   // host is the single source of truth.
   'list_acp_catalog',
   'set_catalog_opt_in',
+  // The registry check behind "Check for updates": `{ reason: 'manual' |
+  // 'background' }`, answered with the host's `AcpRegistrySnapshot`
+  // (`source: 'cache'` when the registry was unreachable).
+  'fetch_acp_registry_snapshot',
   // CAP-6 / Story 9: host-owned verified-atomic ACP install. The web client
   // installs a catalog agent through `install_acp_agent` (the host downloads +
   // verifies sha256 + extracts + atomically activates). The request is
@@ -222,6 +226,13 @@ export const WS_REQUEST_TYPES = [
   // `acp:agent_switch` event to live clients under the same seq. Reply `{}`;
   // unknown session → `not_found`; live-only mode → `unsupported`.
   'record_agent_switch',
+  // A surface read a chat: `{ sessionId, seq, logEpoch? }` (the session-log
+  // seq of the newest turn end it showed, and the log epoch it belongs to) →
+  // `{ sessionId, seq, logEpoch }`, the host's shared last-read marker as it
+  // stands. Idempotent and monotonic: an older seq, or one from another log
+  // epoch, is a no-op. Every `chat_reads` watcher hears when the marker moves.
+  // Unknown session → `not_found`.
+  'mark_chat_read',
   // Watches `{ watch, scope? }` (`projects`, `chat_history`, `agents`; `fs`
   // and `terminals` scoped to a project id; `store` scoped to a key): `watch`
   // queues the full-state frame, then replies `{ watch, scope, revision }`;
@@ -244,7 +255,18 @@ export const WS_REQUEST_TYPES = [
   // on the host (a forced read still reuses one younger than 60 s).
   'list_claude_usage',
   'set_default_claude_account',
-  'set_project_claude_account'
+  'set_project_claude_account',
+  // The canvas gateway's renderer leg (spine AD-21, AD-29). `canvas_mount`
+  // / `canvas_unmount` `{ projectId, mountSeq }` tell the host this connection
+  // holds (or no longer holds) a project's canvas; the host then forwards
+  // agent canvas calls to it as top-level `canvas_call` frames, answered with
+  // `canvas_reply { callId, mountSeq, ok, result | error }`. `params` and
+  // `result` are JSON text, never parsed on the way. Replies `{}`,
+  // `{ unmounted }` and `{ resolved }`. A long `result` goes in several
+  // `canvas_reply`, each `partial: true` but the last, answered `{ accepted }`.
+  'canvas_mount',
+  'canvas_unmount',
+  'canvas_reply'
 ] as const
 
 /** Union of all WS request `type` strings. */
@@ -309,6 +331,7 @@ export const WS_COMMAND_CLASSES: Readonly<
   get_session_payload_tail: ['read', null],
   list_acp_catalog: ['read', null],
   set_catalog_opt_in: ['idempotent', null],
+  fetch_acp_registry_snapshot: ['read', null],
   install_acp_agent: ['command', 'payload'],
   acp_deliver_auth_redirect: ['command', 'receipt-only'],
   store_read: ['read', null],
@@ -319,8 +342,12 @@ export const WS_COMMAND_CLASSES: Readonly<
   remove_project: ['idempotent', null],
   set_default_project: ['idempotent', null],
   record_agent_switch: ['command', 'payload'],
+  mark_chat_read: ['idempotent', null],
   watch: ['read', null],
-  unwatch: ['read', null]
+  unwatch: ['read', null],
+  canvas_mount: ['idempotent', null],
+  canvas_unmount: ['idempotent', null],
+  canvas_reply: ['idempotent', null]
 }
 
 /** Longest accepted `commandId`, in bytes. Mirrors the Rust `MAX_COMMAND_ID_LEN`. */
@@ -594,7 +621,11 @@ export const WS_ERROR_CODES = {
   // for. Never replayed, never executed.
   COMMAND_CONFLICT: 'command_conflict',
   // A request's `commandId` is malformed (not 1-128 chars of [A-Za-z0-9_-]).
-  INVALID_COMMAND_ID: 'invalid_command_id'
+  INVALID_COMMAND_ID: 'invalid_command_id',
+  // The Claude Account a request needs is not signed in: choosing it for a
+  // Project or as the default (nothing changed), or starting a managed Claude
+  // agent on it. The message names the Account and where to sign in.
+  CLAUDE_ACCOUNT_SIGNED_OUT: 'claude_account_signed_out'
 } as const
 
 /** Union of all WS error code strings. */
@@ -891,6 +922,59 @@ export interface WsHeartbeatFrame {
   type: 'heartbeat'
 }
 
+/** `type` of the top-level frame that forwards an agent canvas call (no `seq`). */
+export const WS_CANVAS_CALL_FRAME_TYPE = 'canvas_call'
+
+/** `type` of the top-level frame that says a renderer lost its canvas mount. */
+export const WS_CANVAS_LEASE_LOST_FRAME_TYPE = 'canvas_lease_lost'
+
+/**
+ * Host → the connection that held `projectId`'s canvas at `mountSeq`: this
+ * mount was saved and unmounted because another window or tab opened the
+ * canvas (`takenOver`, spine AD-30) or the mount cap unloaded it (`evicted`,
+ * AD-26).
+ */
+export interface WsCanvasLeaseLostFrame {
+  type: typeof WS_CANVAS_LEASE_LOST_FRAME_TYPE
+  projectId: string
+  mountSeq: number
+  reason: 'takenOver' | 'evicted'
+}
+
+/**
+ * Host → the connection holding `projectId`'s canvas at `mountSeq`: one
+ * figcraft control-protocol call to run in the editor. `params` is JSON text.
+ * Answered with a `canvas_reply` request carrying the same `callId` and
+ * `mountSeq`; the host times the call out, never the renderer.
+ */
+export interface WsCanvasCallFrame {
+  type: typeof WS_CANVAS_CALL_FRAME_TYPE
+  callId: number
+  projectId: string
+  mountSeq: number
+  method: string
+  params: string
+  /** How long the host still waits for the reply, in ms. A call still
+   * queued for a loading editor when it runs out is answered
+   * `CANVAS_TIMEOUT` and never runs. Absent on a notice. */
+  timeoutMs?: number
+}
+
+/** `canvas_mount` reply. A refused report carries `heldElsewhere`: another
+ * window holds the project's lease; otherwise the host no longer has that
+ * mount (its lease grace ran out). */
+export type WsCanvasMountReply = { attached: true } | { attached: false; heldElsewhere: boolean }
+
+/**
+ * `canvas_reply` payload: the result's JSON text, or a typed error. A result
+ * too long for one message is sent as several, each `partial: true` but the
+ * last, and the host joins them. It answers a partial one `{ accepted }`;
+ * `false` tells the sender to stop.
+ */
+export type WsCanvasReplyPayload =
+  | { callId: number; mountSeq: number; ok: true; result: string; partial?: true }
+  | { callId: number; mountSeq: number; ok: false; error: { code: string; message: string } }
+
 /**
  * `type` of the top-level watch frame (no `seq`): the full state of a watch
  * (`reset: true`, revision `n = 1`) or one delta after it. It shares its name
@@ -901,9 +985,9 @@ export interface WsHeartbeatFrame {
 export const WS_WATCH_FRAME_TYPE = 'watch'
 
 /**
- * The watches a connection can hold. `projects`, `chat_history` and `agents`
- * have the empty scope; `fs` and `terminals` are scoped to a project id, `store`
- * to a store key.
+ * The watches a connection can hold. `projects`, `chat_history`, `agents` and
+ * `chat_reads` have the empty scope; `fs` and `terminals` are scoped to a
+ * project id, `store` to a store key.
  */
 export const WS_WATCH_NAMES = [
   'projects',
@@ -911,7 +995,8 @@ export const WS_WATCH_NAMES = [
   'agents',
   'fs',
   'store',
-  'terminals'
+  'terminals',
+  'chat_reads'
 ] as const
 
 /** One of {@link WS_WATCH_NAMES}. */
@@ -988,6 +1073,30 @@ export interface AgentsWatchDelta {
     | 'browser_open_request'
   payload: unknown
 }
+
+/**
+ * `mark_chat_read` request payload and reply: a chat's shared last-read
+ * marker. `seq` counts within the host log incarnation `logEpoch` names; a
+ * host ignores a read sent against another epoch than the session's.
+ * `logEpoch` is absent only from a peer that predates it.
+ */
+export interface ChatReadMark {
+  sessionId: string
+  seq: number
+  logEpoch?: string
+}
+
+/**
+ * `chat_reads` watch state: the last-read marker of every chat a surface has
+ * read, and the log epoch of each (absent from a host that predates it).
+ */
+export interface ChatReadsWatchState {
+  marks: Record<string, number>
+  logEpochs?: Record<string, string>
+}
+
+/** A `chat_reads` delta: one session's marker as it stands after it moved. */
+export type ChatReadsWatchDelta = ChatReadMark
 
 /** `fs` watch state: the canonical root being watched. A new state means: refresh the trees. */
 export interface FsWatchState {

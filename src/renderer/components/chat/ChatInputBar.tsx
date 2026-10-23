@@ -3,12 +3,14 @@ import { useReducedMotion } from 'framer-motion'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import { ClaudeAccountChip } from '@/components/chat/claude-account/ClaudeAccountChip'
+import { ClaudeLimitWarning } from '@/components/chat/claude-account/ClaudeLimitWarning'
 import { Paperclip } from '@/components/icons'
 import { useAgentSkills } from '@/hooks/use-agent-skills'
 import { useAttachmentDropZone } from '@/hooks/use-attachment-drop-zone'
 import { useMentionRecents } from '@/hooks/use-mention-recents'
 import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
 import { useOskViewport } from '@/hooks/use-osk-viewport'
+import { useReloadChat } from '@/hooks/use-reload-chat'
 import { useVisibleSnapshot } from '@/hooks/use-visible-snapshot'
 import type {
   AvailableCommand,
@@ -51,10 +53,12 @@ import { McpBadge } from './McpBadge'
 import { PermissionPrompt } from './PermissionPrompt'
 import { PromptQueuePanel } from './PromptQueuePanel'
 import { SlashCommandMenu, type SlashMenuHandle } from './SlashCommandMenu'
+import { SkillFilesProvider } from './skill-file-links'
 import { useChatComposer } from './use-chat-composer'
 import { useComposerAttachments } from './use-composer-attachments'
 import { useComposerCaretRestore, useComposerMentionSelect } from './use-composer-caret-restore'
 import { useComposerDraft } from './use-composer-draft'
+import { useComposerDraftStart } from './use-composer-draft-start'
 import { useComposerMentions } from './use-composer-mentions'
 
 interface ChatInputBarProps {
@@ -66,6 +70,13 @@ interface ChatInputBarProps {
   busy: boolean
   /** Whether the session is closed/disconnected (fully disables input). */
   disabled: boolean
+  /**
+   * Whether the agent-backed controls (model / mode / config pickers, agent
+   * switch, slash-menu config and mode rows) are disabled. Defaults to
+   * `disabled`. A stopped chat that resumes on input keeps the editor enabled
+   * but these controls off: they would hit the stopped agent.
+   */
+  controlsDisabled?: boolean
   /** Whether the agent accepts inline image content blocks (drag/paste images). */
   imageCapable?: boolean
   /** Whether the agent accepts embedded `resource` blocks (drag/paste text files). */
@@ -111,13 +122,22 @@ interface ChatInputBarProps {
    * work. Defaults to true (visible) for other hosts.
    */
   isVisible?: boolean
+  /**
+   * Fired when the user starts a draft: the first edit or paste into an empty
+   * composer (no text, no attachments). A restored draft or a seed never
+   * fires it. The chat panel uses it to resume a stopped chat early.
+   */
+  onDraftStart?: () => void
 }
+
+const NO_CONFIG_OPTIONS: SessionConfigOption[] = []
 
 export function ChatInputBar({
   session,
   projectRoot,
   busy,
   disabled,
+  controlsDisabled = disabled,
   imageCapable = false,
   embedCapable = false,
   onSend,
@@ -136,7 +156,8 @@ export function ChatInputBar({
   onRemoveQueued,
   onSendQueuedNow,
   compactTop = false,
-  isVisible = true
+  isVisible = true,
+  onDraftStart
 }: ChatInputBarProps): React.JSX.Element {
   const usableConfigOptions = configOptions.filter(
     (option) => option.type === 'boolean' || (option.options?.length ?? 0) > 0
@@ -181,6 +202,7 @@ export function ChatInputBar({
   // list). The badge degrades to the read-only count pill when the registry is
   // empty. Reuses `setMcpServerEnabled` (optimistic + rollback) — no new
   // persistence path. The probe reflects Termul's own client connection.
+  const chatReload = useReloadChat(session.id)
   const mcpServers = useAcpStore((s) => s.mcpServers)
   const setMcpServerEnabled = useAcpStore((s) => s.setMcpServerEnabled)
   const mcpProbeStatus = useAcpStore((s) => s.mcpProbeStatus)
@@ -276,8 +298,10 @@ export function ChatInputBar({
     editorRef,
     slashMenuRef,
     commands,
-    configOptions,
-    modes,
+    // Slash-menu config / mode rows set options on the live agent — hidden
+    // while the agent-backed controls are off.
+    configOptions: controlsDisabled ? NO_CONFIG_OPTIONS : configOptions,
+    modes: controlsDisabled ? null : modes,
     skills: availableSkills,
     disabled,
     onSetConfig,
@@ -288,6 +312,13 @@ export function ChatInputBar({
   })
   const slashOpen = composerSlashOpen
   const mentionMenuOpen = mentions.menuOpen && !disabled && !slashOpen
+
+  const { handleValueChange, handleComposerPaste } = useComposerDraftStart({
+    draftEmpty: value.length === 0 && attachments.length === 0,
+    onDraftStart,
+    setValue,
+    handlePaste
+  })
 
   const canSend = !disabled && !sending && (value.trim().length > 0 || attachments.length > 0)
   const showStop = busy && !canSend
@@ -364,9 +395,8 @@ export function ChatInputBar({
         )
       } else if (hasCommand) {
         // Command pill present (no skills, files, or attachments): the wire
-        // carries the `/<name> ` prefix; the display keeps the raw token text
-        // so the timeline renders the command chip. Wire stays byte-identical
-        // to the pre-token plain-text path (`wireTrimmed`).
+        // keeps `/<name>` where the user typed it. The display keeps the raw
+        // token in that same place so the timeline renders the command chip.
         onSendBlocks(
           wireTrimmed ? [{ type: 'text', text: wireTrimmed }] : [],
           displayTrimmed ? [{ type: 'text', text: displayTrimmed }] : []
@@ -499,7 +529,7 @@ export function ChatInputBar({
     <AgentModelSelector
       sessionId={session.id}
       busy={busy}
-      disabled={disabled}
+      disabled={controlsDisabled}
       modelOption={modelOption}
       modelSource={modelSource}
       thoughtLevel={thoughtLevel}
@@ -518,7 +548,7 @@ export function ChatInputBar({
   const agentModeChip = (
     <ModeChip
       session={session}
-      disabled={disabled}
+      disabled={controlsDisabled}
       onSelect={onSetMode}
       label="Agent"
       agentName={modeAgentName}
@@ -540,7 +570,11 @@ export function ChatInputBar({
     tools: mcpTools,
     onLoadTools: (id: string) => {
       void loadMcpTools(id)
-    }
+    },
+    onReloadChat: chatReload.reload,
+    reloadDisabled: chatReload.disabled,
+    reloadDisabledReason: chatReload.reason,
+    reloading: chatReload.reloading
   }
   const mcpBadge = <McpBadge {...mcpListProps} />
   const composerAddHandle = useMemo(
@@ -633,7 +667,12 @@ export function ChatInputBar({
               </div>
             )}
             {permission && <PermissionPrompt permission={permission} isVisible={isVisible} />}
-            <AttachmentPreviewGroup attachments={attachments} onRemove={removeAttachment} />
+            {!controlsDisabled && <ClaudeLimitWarning sessionId={session.id} atTop={!permission} />}
+            <AttachmentPreviewGroup
+              attachments={attachments}
+              onRemove={removeAttachment}
+              removeDisabled={disabled}
+            />
             <div className="flex items-start gap-1 px-4 pb-1.5 pt-3.5">
               {/* Tiptap rich-text editor — the skill "pill" is a real inline
                   DOM node (a Tiptap `NodeView`), so the caret sits flush
@@ -642,27 +681,29 @@ export function ChatInputBar({
                   scroll-sync. The `value` string (sentinel-token format) is
                   the shared model the wire builder + draft persistence +
                   timeline consume (byte-identical wire payload). */}
-              <ChatComposerEditor
-                className="min-w-0 flex-1"
-                value={value}
-                onValueChange={setValue}
-                onCaretChange={mentions.update}
-                onBeforeEditorKeyDown={handleKeyDown}
-                onPasteAttachments={handlePaste}
-                getSkillPaths={() => skillPathsRef.current}
-                editorRef={editorRef}
-                inputRef={composerInputRef}
-                disabled={disabled || sending}
-                minHeight={26} /* 1 line: 16px × 1.625 */
-                maxHeight={78} /* 3 lines: 3 × 26px, then scroll */
-                placeholder={
-                  disabled
-                    ? 'Composer unavailable'
-                    : hasCommandToken
-                      ? 'Add a message (optional)…'
-                      : 'Ask anything… (/ for commands, @ for files)'
-                }
-              />
+              <SkillFilesProvider projectRoot={projectRoot ?? session.cwd}>
+                <ChatComposerEditor
+                  className="min-w-0 flex-1"
+                  value={value}
+                  onValueChange={handleValueChange}
+                  onCaretChange={mentions.update}
+                  onBeforeEditorKeyDown={handleKeyDown}
+                  onPasteAttachments={handleComposerPaste}
+                  getSkillPaths={() => skillPathsRef.current}
+                  editorRef={editorRef}
+                  inputRef={composerInputRef}
+                  disabled={disabled || sending}
+                  minHeight={26} /* 1 line: 16px × 1.625 */
+                  maxHeight={78} /* 3 lines: 3 × 26px, then scroll */
+                  placeholder={
+                    disabled
+                      ? 'Composer unavailable'
+                      : hasCommandToken
+                        ? 'Add a message (optional)…'
+                        : 'Ask anything… (/ for commands, @ for files)'
+                  }
+                />
+              </SkillFilesProvider>
               {/* Context usage ring: top right, centered on the first line.
                   The mobile row carries the ring in its toolbar instead. */}
               {!isMobileShell && (

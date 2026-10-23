@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const MOCK_AGENT: &str = r#"
-import json, sys
+import json, os, subprocess, sys
 
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
@@ -59,6 +59,10 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": rid,
                   "error": {"code": -32603, "message": "Internal error",
                             "data": {"status": 400}}})
+        elif text == "browser":
+            subprocess.run([os.environ["BROWSER"], "https://auth.example.com/login?state=mock"],
+                           check=True)
+            send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
         elif text == "crash":
             chunk("partial")
             sys.exit(3)
@@ -446,6 +450,38 @@ async fn normal_turn_orders_user_prompt_chunk_terminator() {
     let done = terminators(&events);
     assert_eq!(done[0]["stopReason"], "end_turn");
     assert_eq!(done[0]["turnId"], "t1");
+    h.finish().await;
+}
+
+/// The production spawn path installs the browser-open shim: the agent's
+/// `$BROWSER <url>` reaches every sink as an agent-level
+/// `acp:browser_open_request` carrying that URL. The shim exists only on POSIX
+/// hosts, so this test is POSIX only.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_browser_open_reaches_every_sink_as_a_browser_open_request() {
+    let Some(h) = Harness::start().await else {
+        return;
+    };
+    assert_eq!(h.run("browser", "t1").await.unwrap(), StopReason::EndTurn);
+    let expected = (
+        crate::acp::events::EVENT_BROWSER_OPEN_REQUEST.to_string(),
+        serde_json::json!({
+            "agentId": h.agent_id.0,
+            "url": "https://auth.example.com/login?state=mock",
+        }),
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    for log in &h.logs {
+        while !log.0.lock().contains(&expected) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no browser_open_request reached the sink: {:?}",
+                log.0.lock()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     h.finish().await;
 }
 
@@ -1064,4 +1100,74 @@ async fn close_session_waits_out_an_agent_that_ignores_the_cancel() {
         assert_eq!(seen[1].1["reason"], "closed");
     }
     h.finish().await;
+}
+
+/// CPU time, in clock ticks, of the thread of this process whose `comm` is
+/// `name` (`utime + stime` from `/proc/self/task/<tid>/stat`).
+#[cfg(target_os = "linux")]
+fn thread_cpu_ticks(name: &str) -> Option<u64> {
+    for entry in std::fs::read_dir("/proc/self/task").ok()?.flatten() {
+        let task = entry.path();
+        let Ok(comm) = std::fs::read_to_string(task.join("comm")) else {
+            continue;
+        };
+        if comm.trim() != name {
+            continue;
+        }
+        let stat = std::fs::read_to_string(task.join("stat")).ok()?;
+        let after_comm = &stat[stat.rfind(')')? + 2..];
+        let fields: Vec<&str> = after_comm.split(' ').collect();
+        let utime: u64 = fields.get(11)?.parse().ok()?;
+        let stime: u64 = fields.get(12)?.parse().ok()?;
+        return Some(utime + stime);
+    }
+    None
+}
+
+/// An agent that was only spawned (no session, no prompt) must leave its
+/// driver thread parked. This is the user-visible symptom of #1391; it is
+/// green on trunk in a debug build, because that spin needs an optimized
+/// build, and red there under `cargo test --release`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_agent_driver_thread_stays_parked() {
+    let Some(python) = find_python() else {
+        if std::env::var(SKIP_ENV).as_deref() == Ok("1") {
+            eprintln!("SKIP idle_agent_driver_thread_stays_parked: no python interpreter");
+            return;
+        }
+        panic!("this test needs `python3` (or `python`) on PATH; set {SKIP_ENV}=1 to skip it");
+    };
+    let dir = std::env::temp_dir().join(format!("termul-idle-agent-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("mock_agent.py");
+    std::fs::write(&script, MOCK_AGENT).unwrap();
+    let acp = Arc::new(AcpManager::new(Vec::new()));
+    let spawned = acp
+        .spawn(AgentConfig {
+            config_id: None,
+            name: "mock-agent".to_string(),
+            command: python.to_string(),
+            args: vec!["-u".to_string(), script.to_string_lossy().to_string()],
+            env: std::collections::HashMap::new(),
+            allow_terminal: false,
+        })
+        .await
+        .expect("mock agent initializes");
+    // Thread names are cut to 15 bytes: `acp-agent-` plus five id characters.
+    let thread = format!("acp-agent-{}", &spawned.agent_id.0[..5]);
+    let before = thread_cpu_ticks(&thread).expect("the driver thread is listed in /proc/self/task");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = thread_cpu_ticks(&thread).expect("the driver thread is still alive");
+    acp.kill(&spawned.agent_id)
+        .await
+        .expect("kill the idle agent");
+    let _ = std::fs::remove_dir_all(&dir);
+    // SAFETY: `sysconf` reads a constant and has no preconditions.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    let used = after - before;
+    assert!(
+        used * 4 < ticks_per_second,
+        "the idle acp-agent thread used {used} of {ticks_per_second} clock ticks per second over 2 s"
+    );
 }

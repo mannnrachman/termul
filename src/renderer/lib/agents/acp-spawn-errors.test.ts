@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest'
 import type { AuthMethod } from '@/lib/acp-api'
 import { AcpTransportError } from '@/lib/acp-transport/types'
 import {
+  ACP_RATE_LIMIT_MESSAGE,
+  ACP_STREAM_INTERRUPT_MESSAGE,
   AGENT_AUTH_REQUIRED_CODE,
   AmbiguousAuthError,
   classifySetupError,
+  formatAcpAgentError,
   formatAcpSpawnError,
   isAgentAuthRequiredError,
   isAmbiguousAuthError,
@@ -14,6 +17,31 @@ import {
   providerCodeOf,
   SETUP_ERROR_LABELS
 } from './acp-spawn-errors'
+
+describe('formatAcpAgentError', () => {
+  it('rewrites NGHTTP2_ENHANCE_YOUR_CALM / RetriableError stream closes as rate-limit', () => {
+    expect(
+      formatAcpAgentError(
+        'Error: RetriableError: [internal] Stream closed with error code NGHTTP2_ENHANCE_YOUR_CALM'
+      )
+    ).toBe(ACP_RATE_LIMIT_MESSAGE)
+    expect(formatAcpAgentError('rate limit exceeded')).toBe(ACP_RATE_LIMIT_MESSAGE)
+    expect(formatAcpAgentError('HTTP 429 Too Many Requests')).toBe(ACP_RATE_LIMIT_MESSAGE)
+  })
+
+  it('rewrites generic stream/connection drops as interrupted', () => {
+    expect(formatAcpAgentError('RetriableError: [internal] Stream closed')).toBe(
+      ACP_STREAM_INTERRUPT_MESSAGE
+    )
+    expect(formatAcpAgentError('ECONNRESET')).toBe(ACP_STREAM_INTERRUPT_MESSAGE)
+    expect(formatAcpAgentError('the stream was destroyed')).toBe(ACP_STREAM_INTERRUPT_MESSAGE)
+  })
+
+  it('passes unrelated diagnostics through verbatim', () => {
+    expect(formatAcpAgentError('credit limit exceeded')).toBe('credit limit exceeded')
+    expect(formatAcpAgentError(new Error('insufficient credit'))).toBe('insufficient credit')
+  })
+})
 
 describe('formatAcpSpawnError', () => {
   it('passes non-ENOENT messages through verbatim', () => {
@@ -28,6 +56,102 @@ describe('formatAcpSpawnError', () => {
     expect(formatAcpSpawnError('program not found', { command: 'uvx' })).toMatch(/Install uv/)
     expect(formatAcpSpawnError('command not found', { command: 'cursor-agent' })).toMatch(
       /"cursor-agent"/
+    )
+  })
+
+  it('explains an npx package executable missing after npx itself launched (exit 127)', () => {
+    // JSON data escapes its newline; the appended stderr tail uses real newlines.
+    const raw =
+      'agent failed to start: Internal error: {\n' +
+      '  "data": "Process exited with exit status: 127: sh: codex-acp: command not found\\n"\n' +
+      '}\nagent stderr:\nsh: codex-acp: command not found'
+    const result = classifySetupError(raw, { command: 'npx' })
+    expect(result).toMatchObject({
+      category: 'spawn',
+      label: 'Agent unavailable'
+    })
+    expect(result.detail).toContain('"codex-acp"')
+    expect(result.detail).toContain('npx cache')
+    expect(result.detail).not.toContain('Install Node.js')
+  })
+
+  it.each([
+    '@scope/tool',
+    'tool+extra',
+    'tool.v2'
+  ])('recognizes npx child executable %s without blaming Node.js', (binary) => {
+    const raw = `Process exited with exit status: 127: sh: ${binary}: command not found`
+    const result = formatAcpSpawnError(raw, { command: 'npx' })
+    expect(result).toContain(`"${binary}"`)
+    expect(result).toContain('npm config get cache')
+    expect(result).not.toContain('Install Node.js')
+  })
+
+  it('does not blame the npx cache for other exit-127 or missing-command failures', () => {
+    const other = 'Process exited with exit status: 127: sh: unrelated tool failed'
+    expect(formatAcpSpawnError(other, { command: 'npx' })).toBe(other)
+    expect(
+      formatAcpSpawnError(
+        'Process exited with exit status: 127: sh: codex-acp: command not found',
+        {
+          command: 'uvx'
+        }
+      )
+    ).toContain('Install uv')
+  })
+
+  it('keeps a resolver error that names a different binary verbatim', () => {
+    // Managed claude-acp spawns `node`, but a failed *pre-spawn* probe of the
+    // system claude.cmd names the shim — rewriting it against `node` would
+    // blame the wrong binary.
+    const raw =
+      'program not found or not executable: C:\\Users\\u\\AppData\\Roaming\\npm\\claude.cmd'
+    expect(formatAcpSpawnError(raw, { command: 'node' })).toBe(raw)
+    const result = classifySetupError(raw, { command: 'node' })
+    expect(result.category).toBe('spawn')
+    expect(result.detail).toBe(raw)
+
+    // The bare-name variant — e.g. the claude CLI probe failing to find
+    // `claude` on PATH — names a different program than the spawned `node`.
+    const bare = 'program not found on PATH: claude'
+    expect(formatAcpSpawnError(bare, { command: 'node' })).toBe(bare)
+  })
+
+  it.each([
+    ['npx', 'Could not run npx. Install Node.js and ensure npx is on your PATH, then try again.'],
+    ['uvx', 'Could not run uvx. Install uv and ensure uvx is on your PATH, then try again.'],
+    [
+      'cursor-agent',
+      'Could not start "cursor-agent". Check that the binary exists and is on your PATH.'
+    ]
+  ])('rewrites an OS spawn error for %s even though its trailing text is not the command', (command, guidance) => {
+    const osError =
+      'agent failed to start: Internal error: "No such file or directory (os error 2)"'
+    expect(formatAcpSpawnError(osError, { command })).toBe(guidance)
+    expect(classifySetupError(osError, { command })).toMatchObject({
+      category: 'spawn',
+      detail: guidance
+    })
+  })
+
+  it('keeps resolver wording verbatim when it is wrapped in a transport message', () => {
+    const wrapped = 'agent failed to start: Internal error: "program not found on PATH: claude"'
+    expect(formatAcpSpawnError(wrapped, { command: 'node' })).toBe(wrapped)
+  })
+
+  it('still rewrites a resolver failure that names the command itself', () => {
+    expect(formatAcpSpawnError('program not found on PATH: node', { command: 'node' })).toBe(
+      'Could not start "node". Check that the binary exists and is on your PATH.'
+    )
+    expect(formatAcpSpawnError('spawn C:\\tools\\node.exe ENOENT', { command: 'node' })).toBe(
+      'Could not start "node". Check that the binary exists and is on your PATH.'
+    )
+    expect(
+      formatAcpSpawnError('program not found or not executable: C:\\tools\\node.exe', {
+        command: 'C:\\tools\\node.exe'
+      })
+    ).toBe(
+      'Could not start "C:\\tools\\node.exe". Check that the binary exists and is on your PATH.'
     )
   })
 })
@@ -126,6 +250,15 @@ describe('classifySetupError order and categories (P4)', () => {
     expect(classifySetupError('connection refused').category).toBe('transport')
     expect(classifySetupError('ECONNRESET').category).toBe('transport')
     expect(classifySetupError('agent thread is no longer running').category).toBe('transport')
+  })
+
+  it('rewrites transport/rate-limit detail into friendly copy', () => {
+    expect(classifySetupError('the stream was destroyed').detail).toBe(ACP_STREAM_INTERRUPT_MESSAGE)
+    expect(
+      classifySetupError(
+        'Error: RetriableError: [internal] Stream closed with error code NGHTTP2_ENHANCE_YOUR_CALM'
+      ).detail
+    ).toBe(ACP_RATE_LIMIT_MESSAGE)
   })
 
   it('treats "connection timed out" as transport, not timeout (evicts the process)', () => {

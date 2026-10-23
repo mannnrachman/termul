@@ -2,7 +2,7 @@
 
 import { UNASSIGNED_PROJECT_ID } from '@shared/types/web-projects.types'
 import type { PersistedSessionSummary } from '@shared/types/web-protocol.types'
-import type { ToolCall } from '@/lib/acp-api'
+import type { AvailableCommand, StopReason, ToolCall } from '@/lib/acp-api'
 import { acpHistoryApi } from '@/lib/acp-history-api'
 import { getAcpTransport } from '@/lib/acp-transport'
 import { persistenceApi } from '@/lib/api'
@@ -65,6 +65,12 @@ export interface SessionIndexEntry {
    */
   turnActive?: boolean
   /**
+   * How the last turn failed, when it ended in an `error`, `timeout` or
+   * `crashed` terminator and no prompt followed. Present on session payloads
+   * only; absent on older hosts.
+   */
+  lastTurnError?: PersistedTurnError
+  /**
    * Worktree path + branch the agent runs in (CAP-3). Additive: absent on
    * pre-feature sessions. Powers the CAP-6 indicator + the deleted-worktree
    * fallback; state isolation still keys on `cwd`.
@@ -72,9 +78,11 @@ export interface SessionIndexEntry {
   worktreePath?: string
   worktreeBranch?: string
   /**
-   * Host-recorded current model id + display-name snapshot (CAP-3). Additive:
-   * absent on old entries and on discovered/imported sessions. Read-only on the
-   * renderer — the host (`SessionPersistence`) is the sole writer.
+   * Current model id + display-name snapshot (CAP-3). Additive: absent on old
+   * entries and on discovered/imported sessions. The host
+   * (`SessionPersistence`) is the durable writer. The renderer projection
+   * copies these fields forward and refreshes them from the live session so
+   * the sidebar does not keep the creation-time model.
    */
   modelId?: string
   modelName?: string
@@ -89,6 +97,15 @@ export interface SessionIndexEntry {
    * multi-switch.
    */
   agents?: string[]
+}
+
+/** The failure behind a failed turn's terminator, as the host recorded it. */
+export interface PersistedTurnError {
+  stopReason: StopReason
+  /** Absent when the host recorded no detail (a `crashed` terminator). */
+  message?: string
+  code?: number
+  providerCode?: string
 }
 
 export interface SessionPayload {
@@ -108,6 +125,13 @@ export interface SessionPayload {
    * field existed (pre-feature chats → no separators, rendering unchanged).
    */
   switches?: AgentSwitchRecord[]
+  /**
+   * The session's last known slash-command list. Absent when the host knows
+   * of none, and on older hosts.
+   */
+  commands?: AvailableCommand[]
+  /** Seq of the `commands_update` record that set `commands`. */
+  commandsSeq?: number
 }
 
 /**
@@ -446,6 +470,12 @@ function historyMode(): 'server' | 'live_only' | 'tauri_store' | undefined {
   return getAcpTransport().historyMode?.()
 }
 
+/**
+ * The title both host readers (desktop `acp_history` list, web summary
+ * conversion) give a session the host has not titled yet.
+ */
+export const UNTITLED_HOST_TITLE = 'Untitled Chat'
+
 export function fromPersistedSessionSummary(entry: PersistedSessionSummary): SessionIndexEntry {
   return {
     id: entry.sessionId,
@@ -453,7 +483,7 @@ export function fromPersistedSessionSummary(entry: PersistedSessionSummary): Ses
     agentConfigId: entry.stableAgentNamespace?.startsWith('config:')
       ? entry.stableAgentNamespace.slice('config:'.length)
       : undefined,
-    title: entry.title ?? 'Untitled Chat',
+    title: entry.title ?? UNTITLED_HOST_TITLE,
     cwd: entry.cwd,
     projectId: entry.projectId ?? '',
     createdAt: entry.createdAt,
@@ -724,6 +754,26 @@ export async function loadSessionPayload(id: string): Promise<SessionPayload | n
   if (mode === 'live_only') return null
   const payload = withPlanFences(id, await acpHistoryApi.get(id))
   if (payload) touchPayload(id, payload)
+  return payload
+}
+
+/**
+ * Re-read a session's full payload from the host, replacing the cached copy
+ * in place (pin and plan fences kept). `null` in server and `live_only` modes.
+ */
+export async function reloadSessionPayloadFromHost(id: string): Promise<SessionPayload | null> {
+  const transport = getAcpTransport()
+  const mode = transport.historyMode?.()
+  if ((mode === 'server' && transport.getSessionPayload) || mode === 'live_only') return null
+  const stale = payloadCache.get(id)
+  if (stale) rememberPlanFences(id, stale)
+  const payload = withPlanFences(id, await acpHistoryApi.get(id))
+  if (payload) touchPayload(id, payload)
+  void logFrontendError({
+    level: 'info',
+    source: 'acp.historyPersistence',
+    message: `Re-read session ${id.slice(0, 8)}… from the host: the cached copy ended at seq ${stale?.metadata.lastSeq ?? 'unknown'}, the host is at seq ${payload?.metadata.lastSeq ?? 'unknown'}`
+  })
   return payload
 }
 

@@ -4,7 +4,9 @@ import {
   baseName,
   describeToolCall,
   isSubagentCall,
+  isSubagentRunning,
   readableOutput,
+  summarizeToolActivity,
   toolCallPath
 } from './tool-call-summary'
 
@@ -218,6 +220,207 @@ describe('readableOutput', () => {
   })
 })
 
+describe('summarizeToolActivity', () => {
+  const subagent = (extra?: Record<string, unknown>): ToolCall =>
+    call({
+      kind: 'think',
+      rawInput: { subagent_type: 'explore', description: 'Audit branch', prompt: 'p', ...extra }
+    })
+
+  it('returns null for a turn with no tool calls', () => {
+    expect(summarizeToolActivity([])).toBeNull()
+  })
+
+  it.each([
+    ['execute', 2, 'Ran 1 command', 'Ran 2 commands'],
+    ['read', 2, 'Read 1 file', 'Read 2 files'],
+    ['delete', 2, 'Deleted 1 file', 'Deleted 2 files'],
+    ['move', 2, 'Moved 1 file', 'Moved 2 files'],
+    ['search', 2, 'Ran 1 search', 'Ran 2 searches'],
+    ['fetch', 2, 'Fetched 1 page', 'Fetched 2 pages'],
+    ['switch_mode', 3, 'Switched mode', 'Switched mode 3 times'],
+    ['think', 2, 'Used 1 tool', 'Used 2 tools'],
+    ['other', 2, 'Used 1 tool', 'Used 2 tools'],
+    [undefined, 2, 'Used 1 tool', 'Used 2 tools']
+  ])('classifies kind %s as "%s" / "%s"', (kind, n, singular, plural) => {
+    expect(summarizeToolActivity([call({ kind })])?.label).toBe(singular)
+    const calls = Array.from({ length: n }, () => call({ kind }))
+    expect(summarizeToolActivity(calls)?.label).toBe(plural)
+  })
+
+  it('counts a subagent dispatch as an agent', () => {
+    expect(summarizeToolActivity([subagent()])?.label).toBe('Ran 1 agent')
+    expect(summarizeToolActivity([subagent(), subagent()])?.label).toBe('Ran 2 agents')
+  })
+
+  it.each([
+    'run_in_background',
+    'is_background',
+    'background'
+  ])('counts a subagent with %s: true as a background agent', (key) => {
+    expect(summarizeToolActivity([subagent({ [key]: true })])?.label).toBe('Ran 1 background agent')
+    expect(
+      summarizeToolActivity([subagent({ [key]: true }), subagent({ [key]: true })])?.label
+    ).toBe('Ran 2 background agents')
+  })
+
+  it('keeps a non-true background flag as a plain agent', () => {
+    expect(summarizeToolActivity([subagent({ background: false })])?.label).toBe('Ran 1 agent')
+    expect(summarizeToolActivity([subagent({ background: 'yes' })])?.label).toBe('Ran 1 agent')
+  })
+
+  it('counts an edit whose diffs all create files as created', () => {
+    const created = call({
+      kind: 'edit',
+      content: [
+        { type: 'diff', path: 'a.ts', newText: 'x\ny' },
+        { type: 'diff', path: 'b.ts', oldText: null, newText: 'z' }
+      ]
+    })
+    expect(summarizeToolActivity([created])?.label).toBe('Created 1 file')
+  })
+
+  it('counts an edit touching existing content as edited', () => {
+    const edited = call({
+      kind: 'edit',
+      content: [
+        { type: 'diff', path: 'new.ts', newText: 'x' },
+        { type: 'diff', path: 'old.ts', oldText: 'a', newText: 'b' }
+      ]
+    })
+    expect(summarizeToolActivity([edited])?.label).toBe('Edited 1 file')
+  })
+
+  it('counts a restored edit (no diff content) as edited and keeps its diffStat', () => {
+    const restored = call({
+      kind: 'edit',
+      locations: [{ path: 'src/a.ts' }],
+      diffStat: { added: 5, removed: 1 },
+      restoredSummary: true
+    })
+    expect(summarizeToolActivity([restored])).toEqual({
+      label: 'Edited 1 file',
+      added: 5,
+      removed: 1
+    })
+  })
+
+  it('rolls a mixed turn into first-occurrence phrases', () => {
+    const summary = summarizeToolActivity([
+      call({ kind: 'execute' }),
+      call({ kind: 'execute' }),
+      call({ kind: 'edit', content: [{ type: 'diff', path: 'a.ts', newText: 'x' }] }),
+      call({ kind: 'edit', content: [{ type: 'diff', path: 'b.ts', newText: 'y' }] }),
+      subagent(),
+      subagent(),
+      subagent(),
+      subagent()
+    ])
+    expect(summary?.label).toBe('Ran 2 commands, created 2 files, ran 4 agents')
+  })
+
+  it('orders phrases by first occurrence, not by count', () => {
+    const summary = summarizeToolActivity([
+      call({ kind: 'read' }),
+      call({ kind: 'execute' }),
+      call({ kind: 'read' })
+    ])
+    expect(summary?.label).toBe('Read 2 files, ran 1 command')
+  })
+
+  it('shows four phrases without a tail when exactly four categories ran', () => {
+    const summary = summarizeToolActivity([
+      call({ kind: 'execute' }),
+      call({ kind: 'read' }),
+      call({ kind: 'search' }),
+      call({ kind: 'fetch' })
+    ])
+    expect(summary?.label).toBe('Ran 1 command, read 1 file, ran 1 search, fetched 1 page')
+  })
+
+  it('caps at four phrases and tails the unshown call count as "and N more"', () => {
+    const summary = summarizeToolActivity([
+      call({ kind: 'execute' }),
+      call({ kind: 'read' }),
+      call({ kind: 'search' }),
+      call({ kind: 'fetch' }),
+      call({ kind: 'switch_mode' }),
+      call({ kind: 'switch_mode' }),
+      call({ kind: 'delete' })
+    ])
+    expect(summary?.label).toBe(
+      'Ran 1 command, read 1 file, ran 1 search, fetched 1 page, and 3 more'
+    )
+  })
+
+  it('sums diff counts across live diffs and restored diffStats', () => {
+    const summary = summarizeToolActivity([
+      call({
+        kind: 'edit',
+        content: [{ type: 'diff', path: 'a.ts', oldText: 'a\nb\nc', newText: 'a\nB\nc\nd\ne' }]
+      }),
+      call({ kind: 'edit', locations: [{ path: 'b.ts' }], diffStat: { added: 5, removed: 1 } }),
+      call({ kind: 'execute' })
+    ])
+    // +3 −1 from the live diff (LCS of [a,b,c] vs [a,B,c,d,e]), +5 −1 restored.
+    expect(summary).toEqual({ label: 'Edited 2 files, ran 1 command', added: 8, removed: 2 })
+  })
+
+  it('leads with a single thought before the tool phrases', () => {
+    const summary = summarizeToolActivity([call({ kind: 'execute' }), call({ kind: 'execute' })], {
+      thoughts: 1
+    })
+    expect(summary).toEqual({ label: 'Thought, ran 2 commands', added: 0, removed: 0 })
+  })
+
+  it('counts repeated thoughts as "thought n times"', () => {
+    const summary = summarizeToolActivity(
+      [
+        call({ kind: 'execute' }),
+        call({
+          kind: 'edit',
+          content: [{ type: 'diff', path: 'a.ts', oldText: 'a', newText: 'b' }]
+        })
+      ],
+      { thoughts: 3 }
+    )
+    expect(summary).toEqual({
+      label: 'Thought 3 times, ran 1 command, edited 1 file',
+      added: 1,
+      removed: 1
+    })
+  })
+
+  it('summarizes thoughts without any tool calls', () => {
+    expect(summarizeToolActivity([], { thoughts: 1 })).toEqual({
+      label: 'Thought',
+      added: 0,
+      removed: 0
+    })
+    expect(summarizeToolActivity([], { thoughts: 2 })?.label).toBe('Thought 2 times')
+  })
+
+  it('returns null for zero thoughts and no calls', () => {
+    expect(summarizeToolActivity([], { thoughts: 0 })).toBeNull()
+  })
+
+  it('counts the thought phrase toward the four-phrase cap', () => {
+    const summary = summarizeToolActivity(
+      [
+        call({ kind: 'execute' }),
+        call({ kind: 'read' }),
+        call({ kind: 'search' }),
+        call({ kind: 'fetch' }),
+        call({ kind: 'fetch' })
+      ],
+      { thoughts: 2 }
+    )
+    expect(summary?.label).toBe(
+      'Thought 2 times, ran 1 command, read 1 file, ran 1 search, and 2 more'
+    )
+  })
+})
+
 describe('toolCallPath', () => {
   it('prefers locations[0].path over rawInput and diff content', () => {
     const p = toolCallPath(
@@ -249,5 +452,39 @@ describe('toolCallPath', () => {
   it('returns undefined when no path source is available', () => {
     expect(toolCallPath(call({ kind: 'edit', rawInput: { command: 'ls' } }))).toBeUndefined()
     expect(toolCallPath(call({ kind: 'edit' }))).toBeUndefined()
+  })
+})
+
+describe('isSubagentRunning', () => {
+  it('is running for pending and in_progress only while the parent turn is active', () => {
+    expect(isSubagentRunning(call({ status: 'pending' }), true)).toBe(true)
+    expect(isSubagentRunning(call({ status: 'in_progress' }), true)).toBe(true)
+    // A cancelled or crashed turn can leave the dispatch in flight forever.
+    expect(isSubagentRunning(call({ status: 'pending' }), false)).toBe(false)
+    expect(isSubagentRunning(call({ status: 'in_progress' }), false)).toBe(false)
+  })
+
+  it('treats a missing status as running only while the parent turn is active', () => {
+    expect(isSubagentRunning(call({}), true)).toBe(true)
+    expect(isSubagentRunning(call({ status: undefined }), false)).toBe(false)
+  })
+
+  it('is not running once completed or failed, even in an active turn', () => {
+    expect(isSubagentRunning(call({ status: 'completed' }), true)).toBe(false)
+    expect(isSubagentRunning(call({ status: 'failed' }), true)).toBe(false)
+  })
+
+  it('stays running after the turn when the host still reports running', () => {
+    const live = call({ status: 'in_progress', subagentLifecycle: { state: 'running' } })
+    expect(isSubagentRunning(live, false)).toBe(true)
+    expect(
+      isSubagentRunning(
+        call({ status: 'in_progress', subagentLifecycle: { state: 'completed' } }),
+        true
+      )
+    ).toBe(false)
+    expect(
+      isSubagentRunning(call({ status: 'failed', subagentLifecycle: { state: 'running' } }), false)
+    ).toBe(false)
   })
 })

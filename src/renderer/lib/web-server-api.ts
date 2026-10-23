@@ -17,10 +17,8 @@
  * the web auth gate's 401 UNAUTHORIZED) keeps the server-provided code/message.
  */
 import type {
-  BranchInfo,
   DetectedShells,
   DirectoryEntry,
-  DirtyStatus,
   FileInfo,
   GitCommit,
   GitCommitContext,
@@ -30,15 +28,23 @@ import type {
   GitStashInfo,
   GitStatusDetail,
   IpcResult,
-  ProjectIcon,
-  WorktreeInfo,
-  WorktreeProgressEvent
+  ProjectIcon
 } from '@shared/types/ipc.types'
 import {
   COMMAND_ID_HEADER,
   type FsWriteExpected,
   type HashedFileContent
 } from '@shared/types/ipc.types'
+import type {
+  BaseBranchInfo,
+  BranchInfo,
+  DirtyStatus,
+  GitignoreDir,
+  IncludeCopyResult,
+  SymlinkResult,
+  WorktreeInfo,
+  WorktreeProgressEvent
+} from '@shared/types/worktree.types'
 import {
   bodyToResult,
   getJson,
@@ -52,9 +58,8 @@ import {
   worktreeCreateKey
 } from './ipc/http'
 import { logFrontendError } from './log-api'
-import type { AgentSkillContent, AgentSkillSummary } from './skills-api'
+import type { AgentSkillContent, AgentSkillSummary, SkillFileEntry } from './skills-api'
 import { authHeader } from './web-auth-token'
-import type { BaseBranchInfo, IncludeCopyResult } from './worktree-api'
 
 /**
  * POST JSON and read an `application/x-ndjson` response stream. Each line is
@@ -124,6 +129,38 @@ async function postNdjsonStream<T>(
 }
 
 /**
+ * Bound one web/remote fs request. A blackholed server (TCP open, no reply)
+ * leaves the fetch pending forever. For `/fs/write` that strands the editor's
+ * per-file save lock (`savesInFlight` in editor-store), which a rename or
+ * paste of that file waits on (#1363). For `/fs/read` the save's
+ * uncertain-outcome verify read would hang the same way. 30s is generous for
+ * a same-origin fs call. The abort surfaces as a NETWORK_ERROR the caller
+ * renders as a failure, and the durable boundary log records the timeout
+ * itself (operation + bound, never the requested path).
+ */
+const WEB_FS_REQUEST_TIMEOUT_MS = 30_000
+
+async function boundedFsRequest<T>(
+  operation: string,
+  send: (signal: AbortSignal) => Promise<IpcResult<T>>
+): Promise<IpcResult<T>> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => {
+    void logFrontendError({
+      level: 'warn',
+      source: `webServerFilesystem.${operation}`,
+      message: `${operation} timed out after ${WEB_FS_REQUEST_TIMEOUT_MS}ms (NETWORK_ERROR)`
+    })
+    controller.abort(new Error(`${operation} timed out`))
+  }, WEB_FS_REQUEST_TIMEOUT_MS)
+  try {
+    return await send(controller.signal)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
  * Filesystem ops routed to `termul-server` (`/fs/*`). The methods project
  * creation, file editing, and file inspection touch are implemented. Streaming
  * search (`/search/ws`) and directory watching (server-side `notify` + event
@@ -137,7 +174,9 @@ export const webServerFilesystem = {
 
   /** Creates (or truncates) the file, like the desktop `writeTextFile`; no precondition. */
   async createFile(filePath: string, content = ''): Promise<IpcResult<void>> {
-    return postJson<void>('/fs/write', { path: filePath, content })
+    return boundedFsRequest('createFile', (signal) =>
+      postJson<void>('/fs/write', { path: filePath, content }, signal)
+    )
   },
 
   /**
@@ -150,43 +189,33 @@ export const webServerFilesystem = {
     content: string,
     options?: { expected?: FsWriteExpected }
   ): Promise<IpcResult<void>> {
-    return postJson<void>('/fs/write', {
-      path: filePath,
-      content,
-      ...(options?.expected ? { expected: options.expected } : {})
-    })
+    return boundedFsRequest('writeFile', (signal) =>
+      postJson<void>(
+        '/fs/write',
+        {
+          path: filePath,
+          content,
+          ...(options?.expected ? { expected: options.expected } : {})
+        },
+        signal
+      )
+    )
   },
 
   async readDirectory(dirPath: string): Promise<IpcResult<DirectoryEntry[]>> {
     const encoded = encodeURIComponent(dirPath)
-    // Story 10 (F11): bound the read. A blackholed server (TCP open, no
-    // response) otherwise leaves this fetch pending forever — the Explorer's
-    // `finally` never runs and the panel strands on "Loading…" until a full
-    // reload. 30s is generous for a same-origin directory listing; on expiry
-    // the abort reason surfaces as a NETWORK_ERROR the store renders as a
-    // retryable rootLoadError.
-    const controller = new AbortController()
-    const timer = setTimeout(() => {
-      // Durable boundary log for the timeout event itself — the operation +
-      // the 30s bound + the code the abort surfaces as. The requested
-      // directory path is deliberately NOT logged (sensitive path data).
-      void logFrontendError({
-        level: 'warn',
-        source: 'webServerFilesystem.readDirectory',
-        message: 'readDirectory timed out after 30000ms (NETWORK_ERROR)'
-      })
-      controller.abort(new Error('Directory read timed out'))
-    }, 30_000)
-    try {
-      return await getJson<DirectoryEntry[]>(`/fs/ls?path=${encoded}`, controller.signal)
-    } finally {
-      clearTimeout(timer)
-    }
+    // Story 10 (F11): bound the read. The NETWORK_ERROR the abort surfaces as
+    // renders in the store as a retryable rootLoadError.
+    return boundedFsRequest('readDirectory', (signal) =>
+      getJson<DirectoryEntry[]>(`/fs/ls?path=${encoded}`, signal)
+    )
   },
 
   async readFile(filePath: string): Promise<IpcResult<HashedFileContent>> {
     const encoded = encodeURIComponent(filePath)
-    return getJson<HashedFileContent>(`/fs/read?path=${encoded}`)
+    return boundedFsRequest('readFile', (signal) =>
+      getJson<HashedFileContent>(`/fs/read?path=${encoded}`, signal)
+    )
   },
 
   async getFileInfo(filePath: string): Promise<IpcResult<FileInfo>> {
@@ -411,11 +440,6 @@ export const webServerGit = {
   async branchSwitch(cwd: string, name: string): Promise<void> {
     const res = await postJson<void>('/git/branch-switch', { cwd, name })
     if (!res.success) throw new Error(res.error)
-  },
-
-  async branchCreate(cwd: string, name: string): Promise<void> {
-    const res = await postJson<void>('/git/branch-create', { cwd, name })
-    if (!res.success) throw new Error(res.error)
   }
 }
 
@@ -460,7 +484,24 @@ export const webServerSkills = {
     const res = await getJson<AgentSkillContent>(`/skills/${encodeURIComponent(name)}${params}`)
     if (!res.success) throw new Error(res.error)
     return res.data
+  },
+
+  async files(projectRoot?: string): Promise<SkillFileEntry[]> {
+    const params = projectRoot ? `?projectRoot=${encodeURIComponent(projectRoot)}` : ''
+    const res = await getJson<SkillFileEntry[]>(`/skills-index${params}`)
+    if (!res.success) throw new Error(res.error)
+    return res.data
   }
+}
+
+const SERVER_LOG_FIELD_CHARS = 4096
+
+function truncateCodePoints(value: string, max: number): string {
+  return value.length <= max ? value : Array.from(value).slice(0, max).join('')
+}
+
+function capLogField(value: string): string {
+  return truncateCodePoints(value, SERVER_LOG_FIELD_CHARS + 1)
 }
 
 /**
@@ -478,10 +519,11 @@ export const webServerLog = {
   }): Promise<void> {
     const res = await postJson<void>('/log/frontend-error', {
       level: payload.level ?? 'error',
-      message: payload.message,
-      source: payload.source ?? 'renderer',
-      stack: payload.stack ?? null,
-      componentStack: payload.componentStack ?? null
+      message: capLogField(payload.message),
+      source: capLogField(payload.source ?? 'renderer'),
+      stack: payload.stack === undefined ? null : capLogField(payload.stack),
+      componentStack:
+        payload.componentStack === undefined ? null : capLogField(payload.componentStack)
     })
     if (!res.success) throw new Error(res.error)
   }
@@ -593,8 +635,7 @@ export const webServerMcpProbe = {
  * parity: each method mirrors a desktop `#[tauri::command] worktree_*` handler
  * and returns the SAME `IpcResult<T>` contract (the renderer facade
  * `worktree-api.ts` branches `isTauriContext()` between `invoke(...)` and these
- * HTTP impls). Only the 7 launch-flow routes ship here; the 8 advanced ops
- * stay `WEB_UNSUPPORTED` on web (deferred — see deferred-work.md).
+ * HTTP impls).
  */
 export const webServerWorktree = {
   async list(projectPath: string): Promise<IpcResult<WorktreeInfo[]>> {
@@ -682,6 +723,34 @@ export const webServerWorktree = {
     return postJson<IncludeCopyResult>('/worktree/copy-include-files', {
       projectPath,
       worktreePath
+    })
+  },
+
+  async parseGitignore(projectPath: string): Promise<IpcResult<GitignoreDir[]>> {
+    return postJson<GitignoreDir[]>('/worktree/parse-gitignore', { projectPath })
+  },
+
+  async createSymlinks(
+    projectPath: string,
+    worktreePath: string,
+    symlinkDirs: string[]
+  ): Promise<IpcResult<SymlinkResult[]>> {
+    return postJson<SymlinkResult[]>('/worktree/create-symlinks', {
+      projectPath,
+      worktreePath,
+      symlinkDirs
+    })
+  },
+
+  async ensureSymlinks(
+    projectPath: string,
+    worktreePath: string,
+    symlinkDirs: string[]
+  ): Promise<IpcResult<SymlinkResult[]>> {
+    return postJson<SymlinkResult[]>('/worktree/ensure-symlinks', {
+      projectPath,
+      worktreePath,
+      symlinkDirs
     })
   }
 }

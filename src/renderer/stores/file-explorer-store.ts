@@ -2,7 +2,9 @@ import type { DirectoryEntry, FileSearchResult } from '@shared/types/filesystem.
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
 import { filesystemApi } from '@/lib/api'
+import { renamePathWithOpenEditors } from '@/lib/editor-tab-rename'
 import { logFrontendError } from '@/lib/log-api'
+import { basename } from '@/lib/path-basename'
 import { useSidePanelVisible } from '@/stores/shell-layout-store'
 
 function normalizePath(p: string): string {
@@ -184,8 +186,12 @@ function ensureFileNameStreamSubscription(
 
     // Folder hits (`kind: 'dir'`) exist for the composer @-picker only; the
     // explorer lists files, so drop them to keep its results unchanged.
+    // Hits are root-relative; the explorer opens absolute paths.
+    const root = (state.rootPath ?? '').replace(/\/$/, '')
     set({
-      searchFileNameMatches: event.files.filter((f) => f.kind !== 'dir').map((f) => f.path),
+      searchFileNameMatches: event.files
+        .filter((f) => f.kind !== 'dir')
+        .map((f) => `${root}/${f.path}`),
       searchTruncated: event.truncated || state.searchTruncated
     })
   })
@@ -691,9 +697,15 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
         await copyPath(normalizedSrc, destPath)
       } else {
         // Move file/folder
-        const renameResult = await filesystemApi.renameFile(normalizedSrc, destPath)
+        const renameResult = await renamePathWithOpenEditors(normalizedSrc, destPath)
         if (!renameResult.success) {
-          console.error('Failed to move:', renameResult.error)
+          // Durable failure log (AGENTS.md): operation + file + error code.
+          // The server error text may embed paths, so it is not logged.
+          void logFrontendError({
+            level: 'error',
+            source: 'file-explorer-store.paste',
+            message: `paste move failed for ${basename(normalizedSrc)}: ${renameResult.code ?? 'UNKNOWN_ERROR'}`
+          })
         }
       }
     }

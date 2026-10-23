@@ -1,7 +1,7 @@
 /**
  * ACP (Agent Client Protocol) renderer facade.
  *
- * This is the ONLY module in the renderer that talks to the P0 ACP backend
+ * This is the ONLY module in the renderer that talks to the ACP backend
  * (the `/ws` relay protocol, carried over a WebSocket on web and a Tauri IPC
  * Channel on desktop, plus the host-local `acp_*` domain commands). Components
  * and the acp-store go through here.
@@ -22,7 +22,11 @@ import {
   type ProviderErrorCode
 } from '@shared/types/web-protocol.types'
 import { invoke } from '@tauri-apps/api/core'
-import { type CommandCallOptions, getAcpTransport } from '@/lib/acp-transport'
+import {
+  type AgentIdleWindowStatus,
+  type CommandCallOptions,
+  getAcpTransport
+} from '@/lib/acp-transport'
 import type { AcpRuntimeAvailability } from '@/lib/agents/supported-acp-agents'
 import { type CommandRun, runCommand } from '@/lib/command-engine'
 import { keyDigest } from '@/lib/command-journal'
@@ -30,6 +34,8 @@ import { waitUntilVisible } from '@/lib/command-visibility'
 import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { webServerMcpOAuth } from '@/lib/web-server-api'
+
+export type { AgentIdleWindowStatus }
 
 // --- Identifiers -----------------------------------------------------------
 
@@ -40,9 +46,9 @@ export type SessionId = string
 // --- ACP schema mirrors (only the fields the UI needs) ---------------------
 
 /**
- * Tagged content block. Only `text` is fully handled in P1; other block types
- * (image/audio/resource/resource_link/…) carry their protocol fields in the
- * index signature and render as a placeholder.
+ * Tagged content block. `text` is the only block with a typed field; other
+ * block types (image/audio/resource/resource_link/…) carry their protocol
+ * fields in the index signature.
  */
 export interface ContentBlock {
   type: string
@@ -143,7 +149,7 @@ export interface SessionReopenOutcome {
 // file). Re-exported here so existing `@/lib/acp-api` imports keep working.
 export type { AgentCapabilities } from '@shared/types/web-protocol.types'
 
-/** A tool call (P3 renders these). ACP schema, camelCase on the wire. */
+/** A tool call. ACP schema, camelCase on the wire. */
 export type ToolKind =
   | 'read'
   | 'edit'
@@ -201,7 +207,32 @@ export interface ToolCall {
   /** True for a restored durable file-change summary (payload `toolCalls`):
    * feeds the Changed files panel but never renders as a timeline card. */
   restoredSummary?: boolean
+  /** Subagent usage scalars lifted from `_meta.claudeCode.toolResponse` at ingest
+   * (the next update replaces `_meta`, so the store keeps just these). */
+  subagentUsage?: { totalTokens?: number; totalDurationMs?: number; totalToolUseCount?: number }
+  /** Lifecycle of a subagent dispatch, kept apart from the tool-call status:
+   * a background launch completes its tool call long before the agent ends. */
+  subagentLifecycle?: SubagentLifecycle
+  /** Subagent dispatch that made this call (`_meta.claudeCode.parentToolUseId`).
+   * The timeline shows such a call inside its subagent, not in the main turn. */
+  parentToolCallId?: string
+  /** Latest text the subagent wrote (bounded tail), kept on its dispatch call. */
+  subagentText?: string
   [k: string]: unknown
+}
+
+export type SubagentLifecycleState = 'running' | 'completed' | 'failed' | 'cancelled'
+
+export interface SubagentLifecycle {
+  /** The dispatch returned at launch; the agent continues after its tool call completes. */
+  background?: boolean
+  /** Latest known agent state. Absent when only the launch is known. */
+  state?: SubagentLifecycleState
+  /** Host clock (epoch ms) when the agent reached a terminal state. */
+  endedAt?: number
+  agentId?: string
+  /** File that receives the background agent's output, when the agent names one. */
+  outputFile?: string
 }
 
 export interface ToolCallUpdate {
@@ -215,6 +246,8 @@ export interface ToolCallUpdate {
   rawOutput?: unknown
   /** See {@link ToolCall.diffStat} — carried by durable recovery records. */
   diffStat?: { added: number; removed: number }
+  /** See {@link ToolCall.subagentLifecycle} — derived at ingest. */
+  subagentLifecycle?: SubagentLifecycle
   [k: string]: unknown
 }
 
@@ -452,6 +485,8 @@ export interface MessageChunkEvent {
   content: ContentBlock
   /** ACP message id. Equal ids belong to one message. */
   messageId?: string
+  /** Subagent dispatch that wrote this chunk; its text stays out of the main reply. */
+  parentToolCallId?: string
 }
 export interface ToolCallEvent {
   agentId: AgentId
@@ -515,6 +550,21 @@ export interface AskUserQuestionEvent {
   questionId: string
   question: string
   options: QuestionOption[]
+  /** `ask_user` (issue #784): show the free-text "Other" row. */
+  allowFreeText?: boolean
+  /** `ask_user` (issue #784): more than one option may be picked. */
+  multiSelect?: boolean
+}
+
+/**
+ * `acp:question_cancelled` payload (issue #784) — a pending question that can
+ * no longer be answered while its turn goes on (the agent hung up its
+ * `ask_user` call).
+ */
+export interface QuestionCancelledEvent {
+  agentId: AgentId
+  sessionId: SessionId
+  questionId: string
 }
 
 /**
@@ -714,6 +764,7 @@ export const ACP_EVENTS = {
   configOptionsUpdate: 'acp:config_options_update',
   permissionRequest: 'acp:permission_request',
   questionRequest: 'acp:question_request',
+  questionCancelled: 'acp:question_cancelled',
   elicitationRequest: 'acp:elicitation_request',
   promptComplete: 'acp:prompt_complete',
   agentError: 'acp:agent_error',
@@ -751,7 +802,7 @@ export interface BrowserAgentTabEvent {
 }
 
 /**
- * Respond to `acp:browser_consent_request`. Tauri-only in phase 1 — remote
+ * Respond to `acp:browser_consent_request`. Tauri-only — remote
  * (WS-relayed) clients never render the prompt (the consent strip and card
  * surfaces are desktop-only); the host times out and denies (fail-closed).
  * Returns false for unknown/expired requests.
@@ -910,6 +961,9 @@ export interface AcpRegistrySnapshot {
   fetchedAt?: string | null
 }
 
+/** Who asked for a registry check: the Settings button or the scheduler. */
+export type RegistryCheckReason = 'manual' | 'background'
+
 // --- Ledgered commands (AD-5) ----------------------------------------------
 //
 // Every mutating command below runs through the command engine: its
@@ -942,8 +996,10 @@ async function untilSessionVisible(
   )
 }
 
-export async function acpFetchRegistrySnapshot(forceRefresh = false): Promise<AcpRegistrySnapshot> {
-  return getAcpTransport().fetchRegistrySnapshot(forceRefresh)
+export async function acpFetchRegistrySnapshot(
+  reason: RegistryCheckReason
+): Promise<AcpRegistrySnapshot> {
+  return getAcpTransport().fetchRegistrySnapshot(reason)
 }
 
 export async function acpSpawnAgent(
@@ -1018,12 +1074,24 @@ export async function acpLoadSession(
   agentId: AgentId,
   sessionId: SessionId,
   cwd: string,
-  additionalDirectories?: string[]
+  additionalDirectories?: string[],
+  mcpServers?: McpServer[]
 ): Promise<SessionReopenOutcome> {
+  // A reload carries a different server list than a plain reopen. Digest it
+  // so an in-flight history open is not reused as the reload command.
+  const mcpKey = mcpServers ? keyDigest(JSON.stringify(mcpServers)) : ''
   const run = await ledgered(
     'load_session',
-    `${agentId}|${sessionId}|${cwd}`,
-    (call) => getAcpTransport().loadSession(agentId, sessionId, cwd, additionalDirectories, call),
+    `${agentId}|${sessionId}|${cwd}|${mcpKey}`,
+    (call) =>
+      getAcpTransport().loadSession(
+        agentId,
+        sessionId,
+        cwd,
+        additionalDirectories,
+        // Keep command options in the fifth slot. An empty list is still sent.
+        mcpServers === undefined ? call : { ...call, mcpServers }
+      ),
     { acceptedWithoutResult: () => ({}) }
   )
   await untilSessionVisible(sessionId, run.visibleAt)
@@ -1034,12 +1102,21 @@ export async function acpResumeSession(
   agentId: AgentId,
   sessionId: SessionId,
   cwd: string,
-  additionalDirectories?: string[]
+  additionalDirectories?: string[],
+  mcpServers?: McpServer[]
 ): Promise<SessionReopenOutcome> {
+  const mcpKey = mcpServers ? keyDigest(JSON.stringify(mcpServers)) : ''
   const run = await ledgered(
     'resume_session',
-    `${agentId}|${sessionId}|${cwd}`,
-    (call) => getAcpTransport().resumeSession(agentId, sessionId, cwd, additionalDirectories, call),
+    `${agentId}|${sessionId}|${cwd}|${mcpKey}`,
+    (call) =>
+      getAcpTransport().resumeSession(
+        agentId,
+        sessionId,
+        cwd,
+        additionalDirectories,
+        mcpServers === undefined ? call : { ...call, mcpServers }
+      ),
     { acceptedWithoutResult: () => ({}) }
   )
   await untilSessionVisible(sessionId, run.visibleAt)
@@ -1322,6 +1399,18 @@ export async function acpSetSessionReopenTimeout(secs: number | null): Promise<v
   await getAcpTransport().setSessionReopenTimeout(secs)
 }
 
+// Push how long an idle agent chat stays open, in seconds, or `null` to clear.
+// Desktop updates the reaper. The web transport no-ops; the server locks the
+// window at startup.
+export async function acpSetAgentIdleWindow(secs: number | null): Promise<void> {
+  await getAcpTransport().setAgentIdleWindow(secs)
+}
+
+// The window the host is using now.
+export async function acpGetAgentIdleWindow(): Promise<AgentIdleWindowStatus> {
+  return getAcpTransport().getAgentIdleWindow()
+}
+
 // --- Event subscription ----------------------------------------------------
 
 /**
@@ -1366,6 +1455,8 @@ export const acpApi = {
   setTurnIdleTimeout: acpSetTurnIdleTimeout,
   setSessionNewTimeout: acpSetSessionNewTimeout,
   setSessionReopenTimeout: acpSetSessionReopenTimeout,
+  setAgentIdleWindow: acpSetAgentIdleWindow,
+  getAgentIdleWindow: acpGetAgentIdleWindow,
   installRegistryBinary: acpInstallRegistryBinary,
   installAcpAgent: acpInstallAcpAgent,
   probeRuntime: acpProbeRuntime,

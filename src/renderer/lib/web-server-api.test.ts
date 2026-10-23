@@ -13,6 +13,7 @@ import {
   webServerDialog,
   webServerFilesystem,
   webServerGit,
+  webServerLog,
   webServerShell
 } from './web-server-api'
 
@@ -139,6 +140,37 @@ describe('web-server-api (fetch client)', () => {
     })
   })
 
+  describe('webServerLog.frontendError', () => {
+    it('caps each field one char past the server limit so a 100 KB error still fits the 64 KiB body limit', async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ success: true }))
+
+      await webServerLog.frontendError({
+        message: 'm'.repeat(100_000),
+        source: 'unhandledrejection',
+        stack: 's'.repeat(100_000)
+      })
+
+      const body = mockFetch.mock.calls[0][1].body as string
+      expect(body.length).toBeLessThan(64 * 1024)
+      expect(JSON.parse(body)).toEqual({
+        level: 'error',
+        message: 'm'.repeat(4097),
+        source: 'unhandledrejection',
+        stack: 's'.repeat(4097),
+        componentStack: null
+      })
+    })
+
+    it('cuts on code points so an astral char at the cap is not split into a lone surrogate', async () => {
+      mockFetch.mockResolvedValueOnce(jsonResponse({ success: true }))
+
+      await webServerLog.frontendError({ message: '\u{1F600}'.repeat(5000) })
+
+      const { message } = JSON.parse(mockFetch.mock.calls[0][1].body as string)
+      expect(message).toBe('\u{1F600}'.repeat(4097))
+    })
+  })
+
   describe('webServerFilesystem.createFile', () => {
     it('POSTs /fs/write with { path, content } (defaults content to empty)', async () => {
       mockFetch.mockResolvedValueOnce(jsonResponse({ success: true }))
@@ -162,6 +194,78 @@ describe('web-server-api (fetch client)', () => {
 
       const call = mockFetch.mock.calls[0]?.[1] as RequestInit
       expect(JSON.parse(call.body as string)).toEqual({ path: '/p/f.txt', content: 'hello' })
+    })
+  })
+
+  // Issue #1363: a blackholed server (TCP open, no reply) must not strand a
+  // web fs request forever. The editor's per-file save lock waits on it, and
+  // a rename or paste of that file waits on the save.
+  describe('web fs request timeouts', () => {
+    function blackholedFetch(): void {
+      // Settles only via the caller's abort signal, like a real fetch against
+      // a server that never replies.
+      mockFetch.mockImplementation((_url: string, init?: RequestInit) => {
+        const signal = init?.signal
+        return new Promise<Response>((_resolve, reject) => {
+          const fail = () =>
+            reject(signal?.reason instanceof Error ? signal.reason : new Error('aborted'))
+          if (signal?.aborted) return fail()
+          signal?.addEventListener('abort', fail)
+        })
+      })
+    }
+
+    it('writeFile resolves NETWORK_ERROR after the 30s bound when the reply never arrives', async () => {
+      vi.useFakeTimers()
+      try {
+        blackholedFetch()
+
+        const pending = webServerFilesystem.writeFile('/proj/a.ts', 'x')
+        // 30s request bound, then the ledgered command's awaited resend ladder
+        // (1s + 2s + 4s, each same-id resend aborting on the spent signal).
+        await vi.advanceTimersByTimeAsync(30_000 + 7_000)
+
+        await expect(pending).resolves.toMatchObject({
+          success: false,
+          code: 'NETWORK_ERROR'
+        })
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('readFile resolves NETWORK_ERROR after the 30s bound when the reply never arrives', async () => {
+      vi.useFakeTimers()
+      try {
+        blackholedFetch()
+
+        const pending = webServerFilesystem.readFile('/proj/a.ts')
+        await vi.advanceTimersByTimeAsync(30_000)
+
+        await expect(pending).resolves.toMatchObject({
+          success: false,
+          code: 'NETWORK_ERROR'
+        })
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('readDirectory still resolves NETWORK_ERROR after the 30s bound', async () => {
+      vi.useFakeTimers()
+      try {
+        blackholedFetch()
+
+        const pending = webServerFilesystem.readDirectory('/proj')
+        await vi.advanceTimersByTimeAsync(30_000)
+
+        await expect(pending).resolves.toMatchObject({
+          success: false,
+          code: 'NETWORK_ERROR'
+        })
+      } finally {
+        vi.useRealTimers()
+      }
     })
   })
 

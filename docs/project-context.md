@@ -38,7 +38,7 @@ optimized_for_llm: false
 - **Routing:** React Router DOM `^6.30.1` using **hash-router** patterns (both entries).
 - **Terminal stack:** `@xterm/xterm ^6.1.0-beta.216` (+ addon-fit/search/serialize/web-links/webgl beta), `tauri-pty ^0.1`; Rust `portable-pty 0.9`.
 - **Forms/validation:** React Hook Form `^7.61.1`, `@hookform/resolvers ^3.10.0`, Zod `^3.25.76`.
-- **ACP / AI:** `agent-client-protocol 0.12` (vendored 0.12.1 at `src-tauri/vendor/`), `ai ^7.0.4`, BlockNote `^0.46.2`, CodeMirror 6, streamdown `2.5.0`, mermaid `^11.14.0`.
+- **ACP / AI:** `agent-client-protocol 0.12` (vendored 0.12.1 at `src-tauri/vendor/`), `ai ^7.0.4`, BlockNote `^0.46.2`, CodeMirror 6, streamdown `2.7.0`, mermaid `^11.14.0`.
 - **Remote server stack (Rust):** Axum `0.8` (ws), `tower-http 0.6` (cors/fs/trace), `rust-embed 8.12` (embeds `dist-web/`), `reqwest 0.13` (rustls), `tokio 1` (full), `parking_lot 0.12`, `keyring 3.6` (OS-native per target), `russh 0.64` + `russh-sftp 3`.
 - **Logging:** `tauri-plugin-log 2` + `log 0.4` (desktop runtime) and `tracing 0.1` + `tracing-subscriber 0.3` (standalone server); `src-tauri/src/logging.rs` owns desktop setup, `server_main.rs` uses tracing. Renderer facade: `src/renderer/lib/log-api.ts`.
 - **Shell tests:** `bats ^1.13.0` (`bun run test:shell`); hooks via `husky ^9.1.7`.
@@ -150,7 +150,7 @@ This project ships a **shared-live dual-target architecture**. The desktop app a
   - **Renderer**: import from `src/renderer/lib/log-api.ts` (`logFrontendError`, `installGlobalErrorForwarding`), which forwards to the backend log via the `log_frontend_error` Tauri command (desktop) or `POST /log/frontend-error` (web/remote mode) and never throws. Prefer it over raw `console.*` for errors/warnings that must survive a closed DevTools.
   - **What to log**: meaningful boundaries — operation start, success, and especially failure (with context: ids, paths, offending input/error). Errors must be logged, never swallowed silently. Levels: `info` normal ops, `warn` recoverable degradation, `error` failures, `debug`/`trace` dev-only detail. Never log secrets/credentials (keyring values, tokens, env contents).
   - Reuse existing helpers for new runtime entrypoints: `logging::log_startup_banner`, `logging::install_panic_hook`, `logging::session_id`, `logging::log_file_path`.
-- **ADRs (recommended, not mandatory):** for significant architectural decisions, record an ADR in `docs/adr/` (ADR-001…005 exist) using the `Status / Date / Author / Context / Background / Architecture / Consequences` format, and register it in `docs/adr/README.md`. The `manage_adr` MCP tool can create/update them. Validate against the live codebase (see ADR-003's "Validation note" pattern).
+- **ADRs (recommended, not mandatory):** for significant architectural decisions, record an ADR in `docs/adr/` using the format of ADR-0004 (a `Status / Date / Author` table, then `Context / Decision / Consequences`), and register it in `docs/adr/README.md`. ADR-0004 is the only ADR in the repository; the older ADR numbers cited in source comments were never committed (#357). Validate against the live codebase (see ADR-0004's "Validation note" section).
 
 ### Critical Don't-Miss Rules
 

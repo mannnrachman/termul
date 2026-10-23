@@ -137,7 +137,7 @@ vi.mock('@/stores/git-status-store', async (importOriginal) => ({
   useGitStatusStore: vi.fn((selector: (state: unknown) => unknown) => selector({ statuses: {} }))
 }))
 
-const mockCloseCanvas = vi.hoisted(() => vi.fn())
+const mockUnmountCanvas = vi.hoisted(() => vi.fn())
 
 vi.mock('@/stores/canvas-store', () => ({
   useCanvasStore: Object.assign(
@@ -146,7 +146,7 @@ vi.mock('@/stores/canvas-store', () => ({
     ),
     {
       getState: () => ({
-        closeCanvas: mockCloseCanvas,
+        unmountCanvas: mockUnmountCanvas,
         sessions: {}
       })
     }
@@ -221,106 +221,7 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
-// Stub the Radix context-menu primitives. Every tab is wrapped in
-// `<TabContextMenu>`; the real primitives render via a portal + pointer-based
-// `onSelect` that is hard to drive from jsdom. This stateful stub opens the
-// menu on `contextmenu`, renders `<ContextMenuContent>` only while open
-// (so `findByText('Close Other Editors')` is singular even with multiple
-// editor tabs), closes on Escape, and wires `ContextMenuItem.onSelect` to a
-// click so the existing tab-menu tests assert the close callbacks without
-// the Radix portal/pointer plumbing.
-vi.mock('@/components/ui/context-menu', async () => {
-  const React = await import('react')
-  const MenuCtx = React.createContext<{ open: boolean; setOpen: (o: boolean) => void }>({
-    open: false,
-    setOpen: () => {}
-  })
-  const ContextMenu = ({ children }: { children: React.ReactNode }) => {
-    const [open, setOpen] = React.useState(false)
-    React.useEffect(() => {
-      if (!open) return
-      const onKey = (e: KeyboardEvent) => {
-        if (e.key === 'Escape') setOpen(false)
-      }
-      document.addEventListener('keydown', onKey)
-      return () => document.removeEventListener('keydown', onKey)
-    }, [open])
-    return <MenuCtx.Provider value={{ open, setOpen }}>{children}</MenuCtx.Provider>
-  }
-  const ContextMenuTrigger = ({
-    children,
-    asChild
-  }: {
-    children: React.ReactNode
-    asChild?: boolean
-  }) => {
-    const { setOpen } = React.useContext(MenuCtx)
-    const merged = (e: React.MouseEvent) => {
-      // F2: mirror Radix's composeEventHandlers({ checkForDefaultPrevented: true }) —
-      // if the child's onContextMenu already called preventDefault, do NOT open.
-      if (e.defaultPrevented) return
-      e.preventDefault()
-      setOpen(true)
-    }
-    if (asChild && React.isValidElement(children)) {
-      const child = children as React.ReactElement<{
-        onContextMenu?: (e: React.MouseEvent) => void
-      }>
-      return React.cloneElement(child, {
-        onContextMenu: (e: React.MouseEvent) => {
-          child.props.onContextMenu?.(e)
-          merged(e)
-        }
-      })
-    }
-    return <div onContextMenu={merged}>{children}</div>
-  }
-  const ContextMenuContent = ({
-    children,
-    className
-  }: {
-    children: React.ReactNode
-    className?: string
-  }) => {
-    const { open } = React.useContext(MenuCtx)
-    if (!open) return null
-    return (
-      <div role="menu" className={className}>
-        {children}
-      </div>
-    )
-  }
-  const ContextMenuItem = ({
-    children,
-    disabled,
-    onSelect,
-    variant
-  }: {
-    children: React.ReactNode
-    disabled?: boolean
-    onSelect?: () => void
-    variant?: 'default' | 'destructive'
-  }) => (
-    <div
-      role="menuitem"
-      data-disabled={disabled ? '' : undefined}
-      data-variant={variant}
-      onClick={() => {
-        if (!disabled) onSelect?.()
-      }}
-    >
-      {children}
-    </div>
-  )
-  const ContextMenuSeparator = () => <hr />
-  return {
-    ContextMenu,
-    ContextMenuTrigger,
-    ContextMenuContent,
-    ContextMenuItem,
-    ContextMenuSeparator
-  }
-})
+vi.mock('@/components/ui/context-menu', () => import('@/lib/test-utils/context-menu'))
 
 beforeEach(() => {
   mockSetActiveTab.mockReset()
@@ -720,9 +621,14 @@ describe('WorkspaceTabBar', () => {
     expect(mockRemoveTab).toHaveBeenCalledWith('browser-1')
   })
 
-  it('closes a canvas tab by routing canvas disposal (closeCanvas) before the tab removal', async () => {
+  it('closes a canvas tab without unmounting its canvas (AD-19: closing hides)', async () => {
     const tabs: WorkspaceTab[] = [
-      { type: 'canvas', id: 'canvas-proj-7', projectId: 'proj-7', docPath: 'C:/proj/design.op' }
+      {
+        type: 'canvas',
+        id: 'canvas-proj-7',
+        projectId: 'proj-7',
+        docPath: 'C:/proj/design.figcraft'
+      }
     ]
 
     render(<WorkspaceTabBar paneId="pane-a" tabs={tabs} activeTabId="canvas-proj-7" />)
@@ -731,15 +637,8 @@ describe('WorkspaceTabBar', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Close tab' }))
 
-    // Canvas disposal: the daemon evict (canvas-store closeCanvas with the
-    // tab's projectId) fires BEFORE the workspace tab is removed.
-    expect(mockCloseCanvas).toHaveBeenCalledWith('proj-7')
     expect(mockRemoveTab).toHaveBeenCalledWith('canvas-proj-7')
-    const closeCanvasOrder = mockCloseCanvas.mock.invocationCallOrder[0]
-    const removeTabOrder = mockRemoveTab.mock.invocationCallOrder[0]
-    expect(closeCanvasOrder).toBeGreaterThan(0)
-    expect(removeTabOrder).toBeGreaterThan(0)
-    expect(closeCanvasOrder).toBeLessThan(removeTabOrder)
+    expect(mockUnmountCanvas).not.toHaveBeenCalled()
   })
 
   it('calls startTabDrag when dragging a terminal tab', async () => {

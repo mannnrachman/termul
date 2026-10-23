@@ -39,8 +39,8 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::acp::session_persistence::{
-    is_file_change_kind, last_unmatched_user_prompt, PersistedEventRecord, PersistedSessionStatus,
-    SessionMetadata, MAX_SUMMARY_PATH_CHARS,
+    is_file_change_kind, is_subagent_chunk, last_unmatched_user_prompt, PersistedEventRecord,
+    PersistedSessionStatus, SessionMetadata, MAX_SUMMARY_PATH_CHARS,
 };
 
 /// The renderer session-metadata shape (`SessionIndexEntry` in
@@ -66,12 +66,24 @@ pub struct SessionPayloadMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_epoch: Option<String>,
     pub status: PersistedSessionStatus,
-    /// Issue #838: true while a prompt turn is in progress — the LAST
+    /// Issue #838: whether a prompt turn is in progress — the LAST
     /// `user_prompt` still unmatched by `prompt_complete` (later prompts
     /// supersede earlier ones) and the session status is `active`.
-    /// Serialized additively (absent when false) so older clients ignore it.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub turn_active: bool,
+    ///
+    /// Three states (issue #1192): `true` is a named open turn, `false` says
+    /// the turn ended (a completion or host terminator closed it, or the
+    /// session is not `active`), and absent means "open but unnameable" — a
+    /// prompt with no turn id — so the client derives it from the transcript
+    /// tail. Without an explicit `false`, a client cannot tell a finished turn
+    /// from no data, and reads a trailing user bubble as a turn still running.
+    /// Additive: older clients ignore the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_active: Option<bool>,
+    /// How the LAST turn failed, when it ended in an `error`, `timeout` or
+    /// `crashed` terminator and nothing newer (a prompt or an agent switch)
+    /// followed. A client rebuilds its error banner from it on reopen.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_error: Option<LastTurnError>,
     /// Worktree the chat runs in (CAP-4/6). Carried through the materialized
     /// payload so history reopen + post-reload resume preserve the worktree
     /// binding the agent reattaches to.
@@ -84,6 +96,21 @@ pub struct SessionPayloadMetadata {
     pub model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
+}
+
+/// The failure behind the last turn's terminator. `message` and the rest
+/// come from the terminator's `error` field and are absent when the host
+/// recorded none (a `crashed` terminator, or a log from an older host).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LastTurnError {
+    pub stop_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
 }
 
 /// The renderer `ChatMessage` shape. camelCase keys; `seq` always present
@@ -178,6 +205,34 @@ pub struct MaterializedSessionPayload {
     /// none) — legacy sessions recorded before the summary fields existed
     /// materialize an empty array.
     pub tool_calls: Vec<MaterializedToolCallSummary>,
+    /// The session's last known slash-command list. Both keys are absent
+    /// when the host knows of none.
+    #[serde(flatten)]
+    pub commands: Option<CommandList>,
+}
+
+/// The newest `commands_update` record's `availableCommands` and seq. The
+/// renderer installs a list only when its seq is not older than the one it
+/// holds.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandList {
+    pub commands: Value,
+    pub commands_seq: u64,
+}
+
+impl CommandList {
+    /// The list a `commands_update` record carries, `None` when it has none.
+    #[must_use]
+    pub fn of_record(record: &PersistedEventRecord) -> Option<Self> {
+        record
+            .payload
+            .get("availableCommands")
+            .map(|commands| Self {
+                commands: commands.clone(),
+                commands_seq: record.seq,
+            })
+    }
 }
 
 /// Materialize the renderer-shaped payload for one session from its durable
@@ -224,8 +279,8 @@ pub fn materialize_session_payload(
         // `Closed`/`Error` session cannot have a live turn (user-close
         // persists no terminal record, so the prompt stays unmatched but
         // the turn is dead — reporting it active would be self-inconsistent).
-        turn_active: metadata.status == PersistedSessionStatus::Active
-            && open_turn_from_records(records).is_some(),
+        turn_active: payload_turn_active(&metadata.status, records),
+        last_turn_error: last_turn_error(records),
         worktree_path: metadata.worktree_path.clone(),
         worktree_branch: metadata.worktree_branch.clone(),
         model_id: metadata.model_id.clone(),
@@ -236,7 +291,17 @@ pub fn materialize_session_payload(
         messages,
         switches,
         tool_calls,
+        commands: last_command_list(records),
     }
+}
+
+#[must_use]
+fn last_command_list(records: &[PersistedEventRecord]) -> Option<CommandList> {
+    records
+        .iter()
+        .rev()
+        .find(|record| record.type_ == "commands_update")
+        .and_then(CommandList::of_record)
 }
 
 /// Partially-folded summary state for one `toolCallId`.
@@ -376,6 +441,59 @@ fn open_turn_from_records(records: &[PersistedEventRecord]) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|turn_id| !turn_id.is_empty())
         .map(str::to_string)
+}
+
+/// The payload's `turn_active` (issue #838, #1192). `Some(false)` is explicit:
+/// the turn ended, so a client must not read the transcript tail as an open
+/// turn. `None` keeps the legacy hand-off for an open prompt without a turn id.
+fn payload_turn_active(
+    status: &PersistedSessionStatus,
+    records: &[PersistedEventRecord],
+) -> Option<bool> {
+    if *status != PersistedSessionStatus::Active {
+        return Some(false);
+    }
+    match last_unmatched_user_prompt(records) {
+        None => Some(false),
+        Some(_) if open_turn_from_records(records).is_some() => Some(true),
+        // Open but unnameable: the client derives it from the transcript tail.
+        Some(_) => None,
+    }
+}
+
+/// The last turn's failure: the newest turn boundary (`user_prompt`,
+/// `prompt_complete` or `agent_switch`) must be a failed terminator. A newer
+/// prompt or switch means the failure is no longer the chat's current state.
+fn last_turn_error(records: &[PersistedEventRecord]) -> Option<LastTurnError> {
+    let boundary = records.iter().rev().find(|record| {
+        matches!(
+            record.type_.as_str(),
+            "user_prompt" | "prompt_complete" | "agent_switch"
+        )
+    })?;
+    if boundary.type_ != "prompt_complete" {
+        return None;
+    }
+    let payload = &boundary.payload;
+    let stop_reason = payload.get("stopReason")?.as_str()?;
+    if !matches!(stop_reason, "error" | "timeout" | "crashed") {
+        return None;
+    }
+    let error = payload.get("error");
+    let text = |key: &str| {
+        error
+            .and_then(|error| error.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    Some(LastTurnError {
+        stop_reason: stop_reason.to_string(),
+        message: text("message"),
+        code: error
+            .and_then(|error| error.get("code"))
+            .and_then(Value::as_i64),
+        provider_code: text("providerCode"),
+    })
 }
 
 /// Outcome of stripping a handoff preamble from a `user_prompt` text block
@@ -531,6 +649,7 @@ pub(crate) fn fold_session_records(
                     handoff_boundary: false,
                 });
             }
+            "message_chunk" if is_subagent_chunk(&record.payload) => {}
             "message_chunk" => {
                 let role = if record.payload.get("role").and_then(Value::as_str) == Some("thought")
                 {

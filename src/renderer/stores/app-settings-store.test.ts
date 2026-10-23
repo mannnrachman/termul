@@ -1,5 +1,6 @@
 import { act, renderHook } from '@testing-library/react'
 import { beforeEach, describe, expect, it } from 'vitest'
+import { MONO_STACK } from '@/lib/font-stacks'
 import { DEFAULT_APP_SETTINGS } from '@/types/settings'
 import {
   useAppearanceMode,
@@ -21,11 +22,9 @@ describe('app-settings-store', () => {
   describe('initial state', () => {
     it('should have default font family', () => {
       const { settings } = useAppSettingsStore.getState()
-      // Story 2 (QA F8): default is now the bundled JetBrains Mono Variable
-      // stack — same string as DEFAULT_TERMINAL_OPTIONS.fontFamily.
-      expect(settings.terminalFontFamily).toBe(
-        '"JetBrains Mono Variable", "JetBrains Mono", "Cascadia Code", "SF Mono", Menlo, Monaco, Consolas, "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace'
-      )
+      // Stored default matches the bundled Paper Mono stack. The terminal
+      // renders that stack and does not read a saved family.
+      expect(settings.terminalFontFamily).toBe(MONO_STACK)
     })
 
     it('should have default font size of 14', () => {
@@ -95,9 +94,7 @@ describe('app-settings-store', () => {
 
       const { settings } = useAppSettingsStore.getState()
       expect(settings.terminalFontSize).toBe(20)
-      expect(settings.terminalFontFamily).toBe(
-        '"JetBrains Mono Variable", "JetBrains Mono", "Cascadia Code", "SF Mono", Menlo, Monaco, Consolas, "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono", "Courier New", monospace'
-      )
+      expect(settings.terminalFontFamily).toBe(MONO_STACK)
       expect(settings.defaultShell).toBe('')
     })
 
@@ -151,7 +148,15 @@ describe('app-settings-store', () => {
   })
 
   describe('resetToDefaults', () => {
-    it('should reset all settings to defaults', () => {
+    it('resets every preference to its default and keeps terminal profiles', () => {
+      const profile = {
+        id: 'p1',
+        name: 'Zsh login',
+        shell: '/bin/zsh',
+        args: ['-l'],
+        cwd: '',
+        env: {}
+      }
       // First modify settings
       useAppSettingsStore.setState({
         settings: {
@@ -166,7 +171,8 @@ describe('app-settings-store', () => {
           remoteBindMode: 'all' as const,
           colorTheme: 'nord',
           appearanceMode: 'light' as const,
-          uiZoomLevel: 1.2
+          uiZoomLevel: 1.2,
+          terminalProfiles: [profile]
         },
         isLoaded: true
       })
@@ -175,7 +181,7 @@ describe('app-settings-store', () => {
       resetToDefaults()
 
       const { settings } = useAppSettingsStore.getState()
-      expect(settings).toEqual(DEFAULT_APP_SETTINGS)
+      expect(settings).toEqual({ ...DEFAULT_APP_SETTINGS, terminalProfiles: [profile] })
     })
   })
 

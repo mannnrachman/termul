@@ -509,8 +509,8 @@ describe('MobileChatShell', () => {
         ['a browser tab', [{ type: 'browser', id: 'br1', browserTabId: 'b1' }], 'Example Site'],
         [
           'a canvas tab',
-          [{ type: 'canvas', id: 'c1', projectId: 'p1', docPath: '/proj/design.op' }],
-          'design.op'
+          [{ type: 'canvas', id: 'c1', projectId: 'p1', docPath: '/proj/design.figcraft' }],
+          'design.figcraft'
         ],
         [
           'an agent chat with a live title',
@@ -832,6 +832,7 @@ describe('MobileChatShell', () => {
         'Command palette',
         'New terminal',
         'Project settings',
+        'Reload this chat',
         'Close chat'
       ])
       expect(screen.getByRole('button', { name: 'Close chat' }).className).toContain(
@@ -896,7 +897,12 @@ describe('MobileChatShell', () => {
       })
       await openHeaderSheet()
 
-      expect(sheetRows()).toEqual(['New terminal', 'Project settings', 'Close chat'])
+      expect(sheetRows()).toEqual([
+        'New terminal',
+        'Project settings',
+        'Reload this chat',
+        'Close chat'
+      ])
     })
 
     it('omits Git changes when the project has no path', async () => {
@@ -908,6 +914,7 @@ describe('MobileChatShell', () => {
         'Command palette',
         'New terminal',
         'Project settings',
+        'Reload this chat',
         'Close chat'
       ])
     })
@@ -926,7 +933,7 @@ describe('MobileChatShell', () => {
       renderShell()
       await openHeaderSheet()
 
-      expect(sheetRows()).toEqual(['Files', 'Close chat'])
+      expect(sheetRows()).toEqual(['Files', 'Reload this chat', 'Close chat'])
     })
 
     it('omits Close chat for a non-chat tab', async () => {

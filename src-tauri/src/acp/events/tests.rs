@@ -84,6 +84,7 @@ fn message_chunk_serializes_role_and_content() {
         role: ChunkRole::Agent,
         content: ContentBlock::Text(agent_client_protocol::schema::v1::TextContent::new("hi")),
         message_id: Some("msg-1".to_string()),
+        parent_tool_call_id: None,
     };
     let value = serde_json::to_value(&event).unwrap();
     assert_eq!(value["role"], "agent");
@@ -100,6 +101,7 @@ fn message_chunk_omits_message_id_when_absent() {
         role: ChunkRole::Agent,
         content: ContentBlock::Text(agent_client_protocol::schema::v1::TextContent::new("hi")),
         message_id: None,
+        parent_tool_call_id: None,
     };
     let value = serde_json::to_value(&event).unwrap();
     assert!(value.get("messageId").is_none());
@@ -129,6 +131,7 @@ fn prompt_complete_serializes_stop_reason_snake_case() {
         session_id: SessionId::new("s"),
         stop_reason: StopReason::EndTurn.into(),
         turn_id: None,
+        error: None,
     };
     let value = serde_json::to_value(&event).unwrap();
     assert_eq!(value["stopReason"], "end_turn");
@@ -204,6 +207,7 @@ fn prompt_complete_serializes_turn_id_when_set() {
         session_id: SessionId::new("s"),
         stop_reason: StopReason::EndTurn.into(),
         turn_id: Some("turn-123".to_string()),
+        error: None,
     };
     let value = serde_json::to_value(&event).unwrap();
     assert_eq!(value["turnId"], "turn-123");
@@ -402,6 +406,8 @@ fn ask_user_question_serializes_camel_case() {
                 cardinality: Some("multi".to_string()),
             },
         ],
+            allow_free_text: None,
+        multi_select: None,
     };
     let value = serde_json::to_value(&event).unwrap();
     assert_eq!(value["agentId"], "a1");
@@ -1034,7 +1040,7 @@ fn agent_error_and_crashed_serialize_code_and_data() {
 }
 
 /// gh-821: the event builders carry the RPC code/data into both events with
-/// the `Display` message unchanged (the turn-error + teardown wiring).
+/// the RPC error's own message (the turn-error + teardown wiring).
 #[test]
 fn error_detail_builds_events_with_code_and_data() {
     let rpc = agent_client_protocol::Error::new(-32000, "auth")
@@ -1045,7 +1051,7 @@ fn error_detail_builds_events_with_code_and_data() {
         .clone()
         .into_agent_error(AgentId("a1".to_string()), Some(SessionId::new("s1")));
     let value = serde_json::to_value(&error).unwrap();
-    assert_eq!(value["message"], rpc.to_string());
+    assert_eq!(value["message"], "auth");
     assert_eq!(value["code"], -32000);
     assert_eq!(value["data"]["reason"], "login");
     assert_eq!(value["sessionId"], "s1");
@@ -1118,4 +1124,68 @@ fn agent_error_carries_provider_code_only_for_provider_failures() {
     assert!(build(agent_client_protocol::Error::new(-32000, "Authentication required"))
         .get("providerCode")
         .is_none());
+}
+
+/// Issue #362: the schema's `McpCapabilities.acp` exists only behind the
+/// `unstable_mcp_over_acp` feature, which Termul does not enable. An agent that
+/// advertises it is parsed with the flag dropped, so `acp:agent_spawned`
+/// (whose `capabilities` is this type) never carries it and the renderer cannot "retain it for diagnostics". If this fails
+/// after enabling the feature, update the Experimental MCP-over-ACP notice in
+/// `McpServersSettings.tsx` and the renderer capability types.
+#[test]
+fn mcp_capabilities_acp_is_dropped_without_the_schema_feature() {
+    let advertised: AgentCapabilities = serde_json::from_value(serde_json::json!({
+        "mcpCapabilities": { "http": true, "sse": false, "acp": true }
+    }))
+    .expect("capabilities with an acp flag still parse");
+
+    // `AgentSpawnedEvent.capabilities` is this exact type, serialized as-is.
+    let wire = serde_json::to_value(&advertised).expect("capabilities serialize");
+
+    let mcp = &wire["mcpCapabilities"];
+    assert_eq!(mcp["http"], true, "the supported flags survive: {mcp}");
+    assert!(
+        mcp.get("acp").is_none(),
+        "acp must not reach the renderer while the schema feature is off: {mcp}"
+    );
+}
+
+/// Issue #1335: the live error events reach every client of the session, so a
+/// secret in the RPC error's `data` must appear in neither the message nor the
+/// data they carry.
+#[test]
+fn error_events_keep_no_secret_from_the_error_data() {
+    let rpc = agent_client_protocol::Error::new(-32603, "Internal error").data(serde_json::json!({
+        "headers": { "authorization": "Bearer sk-test" },
+        "status": 500,
+    }));
+    let detail = AcpErrorDetail::from(&rpc);
+    let error = detail
+        .clone()
+        .into_agent_error(AgentId("a1".to_string()), Some(SessionId::new("s1")));
+    let crashed = detail.into_agent_crashed(AgentId("a1".to_string()), None);
+
+    for event in [
+        serde_json::to_value(&error).unwrap(),
+        serde_json::to_value(&crashed).unwrap(),
+    ] {
+        assert_eq!(event["message"], "Internal error");
+        assert_eq!(event["code"], -32603);
+        assert_eq!(event["data"], serde_json::json!({ "status": 500 }));
+        assert!(!event.to_string().contains("sk-test"), "{event}");
+    }
+}
+
+/// Issue #1335: agent-authored `data` is unbounded; the live event carries a
+/// truncated JSON string instead of a huge value.
+#[test]
+fn agent_error_caps_huge_error_data() {
+    let rpc = agent_client_protocol::Error::new(-32603, "Internal error")
+        .data(serde_json::json!({ "detail": "x".repeat(100_000) }));
+    let error = AcpErrorDetail::from(&rpc).into_agent_error(AgentId("a1".to_string()), None);
+    let value = serde_json::to_value(&error).unwrap();
+    assert_eq!(
+        value["data"],
+        format!("{{\"detail\":\"{}…", "x".repeat(3_989))
+    );
 }

@@ -24,6 +24,11 @@ class ResizeObserverMock {
 
 window.ResizeObserver = ResizeObserverMock
 
+// jsdom has no Element.scrollTo; Streamdown pins streaming code blocks to the bottom with it.
+if (typeof Element.prototype.scrollTo !== 'function') {
+  Element.prototype.scrollTo = (() => {}) as typeof Element.prototype.scrollTo
+}
+
 class IntersectionObserverMock {
   observe() {}
   unobserve() {}
@@ -83,7 +88,8 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 vi.mock('@tauri-apps/plugin-clipboard-manager', () => ({
   readText: vi.fn(),
   writeText: vi.fn(),
-  readImage: vi.fn()
+  readImage: vi.fn(),
+  writeImage: vi.fn()
 }))
 
 vi.mock('@tauri-apps/plugin-store', () => ({

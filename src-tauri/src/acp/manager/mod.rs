@@ -71,10 +71,11 @@ mod close;
 mod exit;
 pub(crate) use gates::{ConfigOptionValue, GatewayAuthInput};
 mod history;
+mod native_subagents;
 mod project_binding;
 mod reopen;
 mod spawn_error;
-mod stderr_ring;
+pub(crate) mod stderr_ring;
 mod timeouts;
 mod turn;
 mod wire;
@@ -96,6 +97,10 @@ mod test_driver;
 pub(crate) use test_driver::{FakeAuth, FakeDriver, FakeTurn};
 #[cfg(test)]
 mod real_loop_tests;
+#[cfg(test)]
+mod native_subagents_loop_tests;
+#[cfg(test)]
+mod native_subagents_tests;
 
 pub(crate) use history::*;
 pub use reopen::*;
@@ -196,12 +201,18 @@ enum AcpCommand {
         session_id: SessionId,
         cwd: String,
         additional_directories: Vec<PathBuf>,
+        /// `None` keeps the historical reopen (no client MCP list). `Some`
+        /// attaches that list plus the host plan server. An empty vec still
+        /// attaches the plan server — a reload with no project servers.
+        mcp_servers: Option<Vec<McpServer>>,
         reply: oneshot::Sender<Result<SessionReopenOutcome, String>>,
     },
     ResumeSession {
         session_id: SessionId,
         cwd: String,
         additional_directories: Vec<PathBuf>,
+        /// See [`AcpCommand::LoadSession`].
+        mcp_servers: Option<Vec<McpServer>>,
         reply: oneshot::Sender<Result<SessionReopenOutcome, String>>,
     },
     DeleteSession {
@@ -496,6 +507,8 @@ impl AcpManager {
         sinks: Vec<Arc<dyn EventSink>>,
         claude_agent: Arc<crate::acp::claude_agent::ClaudeAgentService>,
     ) -> Self {
+        #[cfg(unix)]
+        let _ = crate::acp::browser_shim::host_shim_dir();
         let host_plan_server =
             crate::acp::host_mcp::parent::HostPlanServer::start(sinks.clone(), None);
         Self {
@@ -529,6 +542,11 @@ impl AcpManager {
         persistence: Arc<SessionPersistence>,
         claude_agent: Arc<crate::acp::claude_agent::ClaudeAgentService>,
     ) -> Self {
+        // Host start: claim this process's browser-shim dir and sweep the dirs
+        // that killed hosts left behind. `with_claude_agent` does the same for
+        // a desktop host whose session store failed to open.
+        #[cfg(unix)]
+        let _ = crate::acp::browser_shim::host_shim_dir();
         let host_plan_server = crate::acp::host_mcp::parent::HostPlanServer::start(
             sinks.clone(),
             Some(Arc::clone(&persistence)),
@@ -546,6 +564,12 @@ impl AcpManager {
     #[must_use]
     pub fn persistence(&self) -> Option<Arc<SessionPersistence>> {
         self.persistence.clone()
+    }
+
+    /// The canvas call router renderers report their mounts and replies to.
+    #[must_use]
+    pub fn canvas_router(&self) -> Arc<crate::acp::host_mcp::canvas::CanvasRouter> {
+        self.host_plan_server.canvas_router()
     }
     /// Host-authored durable agent-switch marker (CAP-2): the relay numbers,
     /// persists and delivers it through this manager's sinks, then the flush
@@ -831,6 +855,7 @@ impl AcpManager {
                 );
                 return Err(with_stderr_tail(reason.to_string(), &stderr_ring));
             }
+            self.host_plan_server.name_agent(&agent_id.0, &config.name);
             agents.insert(
                 agent_id.clone(),
                 AgentEntry {
@@ -1040,7 +1065,7 @@ impl AcpManager {
         let outcome = async {
             // Inject OAuth Bearer tokens into HTTP/SSE MCP server configs so
             // authenticated servers (e.g., Mobbin) work in agent sessions.
-            let combined_mcp_servers = inject_oauth_tokens(combined_mcp_servers);
+            let combined_mcp_servers = inject_oauth_tokens(combined_mcp_servers).await;
 
             gate_mcp_servers(&caps, &combined_mcp_servers)?;
             let tx = self.command_tx(agent_id)?;
@@ -1086,26 +1111,39 @@ impl AcpManager {
     }
 
     /// Load an existing session. Gated on the agent's `loadSession` capability.
+    ///
+    /// `mcp_servers`: `None` reopens as before (no client MCP list). `Some`
+    /// connects those servers and the host plan server on this session.
     pub async fn load_session(
         &self,
         agent_id: &AgentId,
         session_id: SessionId,
         cwd: String,
         additional_directories: Vec<String>,
+        mcp_servers: Option<Vec<McpServer>>,
     ) -> Result<SessionReopenOutcome, String> {
         self.reject_session_owned_by_other_mid_turn(agent_id, &session_id)
             .await?;
         let caps = self.capabilities(agent_id)?;
         gate_load_session(&caps)?;
         let directories = filter_additional_directories(&caps, &cwd, &additional_directories);
+        let (mcp_servers, plan_token) =
+            self.prepare_reopen_mcp(agent_id, &session_id.0, &caps, mcp_servers).await?;
         let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::LoadSession {
+        let outcome = send_command(&tx, |reply| AcpCommand::LoadSession {
             session_id,
             cwd,
             additional_directories: directories,
+            mcp_servers,
             reply,
         })
-        .await
+        .await;
+        if outcome.is_err() {
+            if let Some(token) = plan_token {
+                self.host_plan_server.unregister_by_token(&token);
+            }
+        }
+        outcome
     }
 
     /// Resume a session. Gated on the agent's `sessionCapabilities.resume`.
@@ -1124,20 +1162,69 @@ impl AcpManager {
         session_id: SessionId,
         cwd: String,
         additional_directories: Vec<String>,
+        mcp_servers: Option<Vec<McpServer>>,
     ) -> Result<SessionReopenOutcome, String> {
         self.reject_session_owned_by_other_mid_turn(agent_id, &session_id)
             .await?;
         let caps = self.capabilities(agent_id)?;
         gate_resume_session(&caps)?;
         let directories = filter_additional_directories(&caps, &cwd, &additional_directories);
+        let (mcp_servers, plan_token) =
+            self.prepare_reopen_mcp(agent_id, &session_id.0, &caps, mcp_servers).await?;
         let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::ResumeSession {
+        let outcome = send_command(&tx, |reply| AcpCommand::ResumeSession {
             session_id,
             cwd,
             additional_directories: directories,
+            mcp_servers,
             reply,
         })
-        .await
+        .await;
+        if outcome.is_err() {
+            if let Some(token) = plan_token {
+                self.host_plan_server.unregister_by_token(&token);
+            }
+        }
+        outcome
+    }
+
+    /// Build the MCP list for a reload-style reopen.
+    ///
+    /// `None` leaves the request unchanged (history open, resume chat).
+    /// `Some` prepends the host plan server, injects OAuth headers, and
+    /// gates transports. The plan token is bound to the known session id.
+    /// The caller drops the token when the reopen fails.
+    async fn prepare_reopen_mcp(
+        &self,
+        agent_id: &AgentId,
+        session_id: &str,
+        caps: &AgentCapabilities,
+        mcp_servers: Option<Vec<McpServer>>,
+    ) -> Result<(Option<Vec<McpServer>>, Option<String>), String> {
+        let Some(mcp_servers) = mcp_servers else {
+            return Ok((None, None));
+        };
+        // Drop a token from an earlier create or reload of this session.
+        self.host_plan_server.unregister_session(session_id);
+        let (port, token, provisional_sid) = self.host_plan_server.register_session(&agent_id.0);
+        self.host_plan_server.bind_session(&token, session_id);
+        let mut combined = build_internal_plan_stdio(&agent_id.0, port, &token, &provisional_sid);
+        combined.extend(mcp_servers);
+        // Count before OAuth injection. `inject_oauth_tokens` returns servers
+        // that can carry bearer tokens. Logging that value, including its
+        // length, is clear-text logging of the tokens.
+        let server_count = combined.len();
+        let combined = inject_oauth_tokens(combined).await;
+        if let Err(error) = gate_mcp_servers(caps, &combined) {
+            self.host_plan_server.unregister_by_token(&token);
+            return Err(error);
+        }
+        log::info!(
+            "[acp] session {} reopen attaches {} mcp servers",
+            crate::logging::redact_session_id(session_id),
+            server_count
+        );
+        Ok((Some(combined), Some(token)))
     }
 
     /// Delete an agent session. Gated on `sessionCapabilities.delete`.
@@ -1316,7 +1403,8 @@ impl AcpManager {
     ) -> Result<(), String> {
         let tx = self.command_tx(agent_id)?;
         let cancelled_session = session_id.0.clone();
-        let result = send_command(&tx, |reply| AcpCommand::CancelPrompt { session_id, reply }).await;
+        let result =
+            send_command(&tx, |reply| AcpCommand::CancelPrompt { session_id, reply }).await;
         // The driver resolved every parked approval and question of the session
         // as cancelled before it replied, whatever the reply says.
         self.release_session_tickets(&cancelled_session);
@@ -1969,7 +2057,8 @@ impl AcpManager {
                     AcpCommand::RespondPermission {
                         request_id, reply, ..
                     } => {
-                        let _ = reply.send(Err(format!("unknown permission request: {request_id}")));
+                        let _ =
+                            reply.send(Err(format!("unknown permission request: {request_id}")));
                     }
                     AcpCommand::AnswerQuestion {
                         question_id, reply, ..
@@ -2009,7 +2098,8 @@ impl AcpManager {
             while let Some(command) = command_rx.recv().await {
                 match command {
                     AcpCommand::SessionIds { reply } => {
-                        let _ = reply.send(Ok(sessions.iter().map(|(id, ..)| id.clone()).collect()));
+                        let _ =
+                            reply.send(Ok(sessions.iter().map(|(id, ..)| id.clone()).collect()));
                     }
                     AcpCommand::SessionRoots { reply } => {
                         let _ = reply.send(Ok(sessions

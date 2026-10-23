@@ -134,7 +134,11 @@ fn gated_router(dir: &Path, allow_remote_writes: bool, shared_live_denied: bool)
     )
 }
 
-async fn factory_key_post(app: Router, peer: SocketAddr, body: &str) -> (StatusCode, serde_json::Value) {
+async fn factory_key_post(
+    app: Router,
+    peer: SocketAddr,
+    body: &str,
+) -> (StatusCode, serde_json::Value) {
     let response = app
         .oneshot(
             Request::builder()
@@ -152,7 +156,10 @@ async fn factory_key_post(app: Router, peer: SocketAddr, body: &str) -> (StatusC
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
 }
 
 /// D8-F2: an authenticated but non-loopback peer without the opt-in must be
@@ -257,6 +264,67 @@ async fn health_returns_capability_json_for_loopback_peer() {
         parsed["allowRemoteWrites"], true,
         "loopback peer must be admitted even without the opt-in (mirrors check_local_only)"
     );
+    assert_eq!(
+        parsed["caseInsensitivePaths"],
+        cfg!(any(windows, target_os = "macos")),
+        "the host reports whether its filesystem folds path case (#641)"
+    );
+}
+
+#[tokio::test]
+async fn agent_idle_window_returns_the_ipc_envelope() {
+    let dir = TempDir::new("idle-window");
+    let resp = test_router_with_fixture(dir.path())
+        .oneshot(
+            Request::builder()
+                .uri("/host/agent-idle-window")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
+                .body(Body::empty())
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body).expect("idle window body is JSON");
+    assert_eq!(parsed["success"], true);
+    assert!(parsed["data"]["secs"].as_u64().is_some_and(|secs| secs > 0));
+    let source = parsed["data"]["source"].as_str().expect("source");
+    assert!(
+        matches!(source, "default" | "setting" | "env" | "operator"),
+        "{source}"
+    );
+}
+
+#[tokio::test]
+async fn post_agent_idle_window_applies_a_settings_choice() {
+    let _guard = crate::web::agent_reaper::IDLE_WINDOW_TEST_LOCK.lock().await;
+    crate::web::agent_reaper::reset_agent_idle_window_for_tests();
+    crate::web::agent_reaper::install_agent_idle_baseline(1800, None);
+    let dir = TempDir::new("idle-window-set");
+    let resp = test_router_with_fixture(dir.path())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/host/agent-idle-window")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
+                .body(Body::from(r#"{"secs":7200}"#))
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(parsed["data"]["secs"], 7200);
+    assert_eq!(parsed["data"]["source"], "setting");
+    crate::web::agent_reaper::reset_agent_idle_window_for_tests();
 }
 
 /// Non-loopback peer WITHOUT the opt-in → `allowRemoteWrites:false`. This
@@ -370,6 +438,94 @@ async fn health_reports_admitted_for_non_loopback_with_opt_in() {
         parsed["allowRemoteWrites"], true,
         "non-loopback peer with opt-in must be admitted"
     );
+}
+
+/// Bug-report routes (spec-bug-report-dialog): both are registered in the
+/// test-variant router and guarded as `/log/` mutations — a denied peer gets
+/// the `FORBIDDEN` IpcBody and never reaches the collect/submit work (an
+/// admitted `/log/report-bug` would spawn a real `gh`, so the denied guard
+/// is the only side-effect-free probe at this level; admitted-path coverage
+/// lives in `web/diagnostics_api/tests.rs`).
+#[tokio::test]
+async fn bug_report_routes_are_registered_and_write_guarded() {
+    let dir = TempDir::new("bug-report-routes");
+    let app = test_router_with_fixture(dir.path());
+
+    // Registered as POST routes: a bare GET is a method rejection, not the
+    // SPA fallback's 200/404.
+    for path in ["/log/diagnostics", "/log/report-bug"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(
+            resp.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{path} must be a registered POST route"
+        );
+    }
+
+    // A non-loopback peer without the opt-in is refused BEFORE the collect
+    // runs (no host log tail may leak) or `gh` is spawned.
+    let remote = SocketAddr::from(([203, 0, 113, 9], 40000));
+    for (path, body) in [
+        ("/log/diagnostics", "{}"),
+        ("/log/report-bug", r#"{"title":"t","body":"b"}"#),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .extension(ConnectInfo(remote))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(parsed["success"], false, "{path}");
+        assert_eq!(parsed["code"], "FORBIDDEN", "{path}");
+    }
+
+    // Shared-live posture denies every peer, loopback included.
+    let shared_live = gated_router(dir.path(), true, true);
+    for (path, body) in [
+        ("/log/diagnostics", "{}"),
+        ("/log/report-bug", r#"{"title":"t","body":"b"}"#),
+    ] {
+        let resp = shared_live
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
+                    .body(Body::from(body))
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(parsed["code"], "FORBIDDEN", "{path} in shared-live mode");
+    }
 }
 
 #[tokio::test]
@@ -539,6 +695,7 @@ fn requires_token_covers_api_prefixes_and_public_paths() {
         assert!(!requires_token(public), "{public} must stay public");
     }
     for gated in [
+        "/host/agent-idle-window",
         "/projects",
         "/projects/default",
         "/projects/p-1",
@@ -550,39 +707,35 @@ fn requires_token_covers_api_prefixes_and_public_paths() {
         "/search/content",
         "/skills",
         "/skills/x",
+        "/skills-index",
         "/log/frontend-error",
+        "/log/diagnostics",
+        "/log/report-bug",
         "/shells",
         "/acp/catalog",
         "/acp/install",
         "/worktree/list",
-        // OpenPencil canvas mode: the renderer-facade API routes stay
-        // bearer-gated…
+        // The renderer-facade API routes stay bearer-gated…
         "/canvas/open",
         "/canvas/close",
-        "/canvas/save",
+        "/canvas/read-document",
+        "/canvas/document-loaded",
+        "/canvas/dirty-changed",
+        "/canvas/set-visible",
+        "/canvas/write-snapshot",
+        "/canvas/disk-changed",
+        "/canvas/resolve-conflict",
+        "/canvas/crashed",
     ] {
         assert!(requires_token(gated), "{gated} must require the token");
     }
-    // …but the canvas-credential surface is exempt from the bearer gate
-    // (browser iframes cannot send Authorization headers):
-    // - `/canvas/<id>/*` embed/proxy paths (the `?ct=` canvas token),
-    // - `/canvas/mcp` (bearer OR `op_canvas_ct` cookie, canvas layer),
-    // - the ROOT canvas routes `/pkg|/canvaskit|/api` (not under any gated
-    //   prefix; the `op_canvas_ct` cookie middleware owns them).
+    // …but the `/canvas/<id>/<token>/*` bundle paths (the canvas token) are
+    // exempt from the bearer gate (browser iframes cannot send Authorization
+    // headers).
     for canvas_credentialed in [
         "/canvas/cv0123456789abcdef",
         "/canvas/cv0123456789abcdef/",
-        "/canvas/cv0123456789abcdef/pkg/op_host_web.js",
-        "/canvas/cv0123456789abcdef/api/mcp/events",
-        "/canvas/mcp",
-        "/pkg",
-        "/pkg/",
-        "/pkg/op_host_web.js",
-        "/canvaskit",
-        "/canvaskit/canvaskit.js",
-        "/api",
-        "/api/",
-        "/api/mcp/events",
+        "/canvas/cv0123456789abcdef/0123/assets/app.js",
     ] {
         assert!(
             !requires_token(canvas_credentialed),
@@ -792,7 +945,7 @@ async fn api_routes_keep_priority_over_static_fallback() {
     assert_eq!(parsed["status"], "ok");
 }
 
-// --- OpenPencil canvas routes (spec-openpencil-canvas-mode) ---
+// --- Canvas routes ---
 
 #[tokio::test]
 async fn canvas_routes_require_auth_when_gated() {
@@ -823,40 +976,14 @@ async fn canvas_routes_require_auth_when_gated() {
         "/canvas/open rejected by the outer bearer gate"
     );
 
-    // `/canvas/mcp` is EXEMPT from the bearer gate — its rejection comes
-    // from the canvas MCP layer itself (bearer OR per-canvas cookie).
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/canvas/mcp")
-                .extension(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .expect("build request"),
-        )
-        .await
-        .expect("router response");
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-    assert_eq!(parsed["code"], "UNAUTHORIZED");
-    assert_eq!(
-        parsed["error"], "canvas mcp requires a web auth bearer token or canvas cookie",
-        "rejected by the canvas MCP layer, not the bearer gate"
-    );
-
-    // The embed/proxy paths are exempt too — they pass straight through to
-    // the canvas-token middleware (`ct` rejection).
+    // The bundle paths are exempt too — they pass straight through to the
+    // canvas-token check (`ct` rejection).
     let resp = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/canvas/cv0123456789abcdef/pkg/x.js")
+                .uri("/canvas/cv0123456789abcdef/assets/x.js")
                 .body(Body::empty())
                 .expect("build request"),
         )
@@ -870,88 +997,47 @@ async fn canvas_routes_require_auth_when_gated() {
     assert_eq!(parsed["code"], "UNAUTHORIZED");
     assert_eq!(
         parsed["error"], "canvas session token missing or invalid",
-        "rejected by the canvas-token gate, not the bearer gate"
+        "rejected by the canvas-token check, not the bearer gate"
     );
-
-    // The root canvas routes are not bearer gated either — no daemon on
-    // this fixture → typed 502 DAEMON_DOWN (proving routing reached the
-    // canvas handler, not a 401 from the outer gate).
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/pkg/op_host_web.js")
-                .header("cookie", "op_canvas_ct_cv0123456789abcdef=whatever")
-                .body(Body::empty())
-                .expect("build request"),
-        )
-        .await
-        .expect("router response");
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-    assert_eq!(parsed["code"], "DAEMON_DOWN");
-
-    // With the bearer token the /canvas/mcp request reaches the canvas
-    // handler, which (no pool on this fixture) reports the typed 502
-    // DAEMON_DOWN.
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/canvas/mcp")
-                .extension(axum::extract::ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
-                .header("authorization", "Bearer t0ken")
-                .header("content-type", "application/json")
-                .body(Body::from("{}"))
-                .expect("build request"),
-        )
-        .await
-        .expect("router response");
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-    assert_eq!(parsed["code"], "DAEMON_DOWN");
 }
 
 #[tokio::test]
-async fn non_canvas_root_paths_fall_through_to_spa_unchanged() {
-    // Only `/pkg|/canvaskit|/api` are canvas routes; anything else at the
-    // root still falls through to the static SPA fallback (here: the
-    // ServeDir index.html fallback from the fixture).
+async fn root_paths_fall_through_to_spa_including_the_retired_daemon_relays() {
+    // `/pkg`, `/canvaskit` and `/api` were root relays to the retired
+    // canvas daemon. They are plain SPA paths now (here: the ServeDir
+    // index.html fallback from the fixture).
     let dir = TempDir::new("canvas-spa-fallthrough");
     fs::write(dir.path().join("index.html"), "<html>fixture</html>").expect("index");
-    let resp = test_router_with_fixture(dir.path())
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/some/other/root/path")
-                .body(Body::empty())
-                .expect("build request"),
-        )
-        .await
-        .expect("router response");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    assert_eq!(
-        String::from_utf8(body.to_vec()).expect("utf8"),
-        "<html>fixture</html>",
-        "SPA fallback serves index.html for non-canvas root paths"
-    );
+    for uri in [
+        "/some/other/root/path",
+        "/pkg/x.js",
+        "/canvaskit/x.js",
+        "/api/mcp/events",
+    ] {
+        let resp = test_router_with_fixture(dir.path())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("build request"),
+            )
+            .await
+            .expect("router response");
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(
+            String::from_utf8(body.to_vec()).expect("utf8"),
+            "<html>fixture</html>",
+            "SPA fallback serves index.html for {uri}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn ungated_canvas_open_degrades_to_daemon_down_without_pool() {
-    // `router_with_static` never attaches a pool, so the canvas routes run
-    // in degraded mode: IpcBody failure with HTTP 200 (the app-level error
-    // contract, mirroring the Tauri command envelope).
+async fn ungated_canvas_open_refuses_a_doc_outside_every_project() {
     let dir = TempDir::new("canvas-ungated");
     let resp = test_router_with_fixture(dir.path())
         .oneshot(
@@ -964,7 +1050,7 @@ async fn ungated_canvas_open_degrades_to_daemon_down_without_pool() {
                 ))))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"docPath":"C:/proj/design.op","projectId":"p-1"}"#,
+                    r#"{"docPath":"C:/proj/design.figcraft","projectId":"p-1","clientInstanceId":"tab"}"#,
                 ))
                 .expect("build request"),
         )
@@ -976,7 +1062,7 @@ async fn ungated_canvas_open_degrades_to_daemon_down_without_pool() {
         .expect("read body");
     let parsed: serde_json::Value = serde_json::from_slice(&body).expect("json body");
     assert_eq!(parsed["success"], false);
-    assert_eq!(parsed["code"], "DAEMON_DOWN");
+    assert_eq!(parsed["code"], "PATH_VALIDATION_FAILED");
 }
 
 fn router_for_origins(dir: &Path, origins: OriginPolicy) -> Router {
@@ -1217,7 +1303,8 @@ async fn serve_origins(origins: OriginPolicy) -> (TempDir, u16, tokio::task::Joi
         let _ = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
-        ).await;
+        )
+        .await;
     });
     (dir, port, handle)
 }

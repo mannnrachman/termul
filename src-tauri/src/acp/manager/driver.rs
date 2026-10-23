@@ -128,6 +128,7 @@ pub(super) fn run_agent(
         reaped.store(true, Ordering::Release);
         map.remove(&agent_id);
     }
+    host_plan_server.forget_agent(&agent_id.0);
     // Only surface lifecycle events for an agent the renderer actually saw.
     // A kill, reap or crash is announced to every sink with its reason; only
     // process shutdown (`kill_all`) stays silent.
@@ -268,9 +269,10 @@ pub(super) fn run_agent(
     }
 }
 
-/// Handle an inbound `session/update` notification from the agent: nudge the
-/// active turn's idle deadline, apply the story-3 replay-window suppression,
-/// bind tool calls, apply the AD-8 title gate, then fan out to the sinks.
+/// Handle an inbound `session/update` notification from the agent: drop a
+/// repeated command list, nudge the active turn's idle deadline, apply the
+/// story-3 replay-window suppression, bind tool calls, apply the AD-8 title
+/// gate, then fan out to the sinks.
 ///
 /// Extracted from the connection-builder closure so the routing logic can be
 /// unit-tested without a live connection (cf. `gate_load_session`).
@@ -282,6 +284,20 @@ pub(super) async fn handle_session_notification(
     notification: agent_client_protocol::schema::v1::SessionNotification,
 ) -> Result<(), agent_client_protocol::Error> {
     let session_id = notification.session_id.0.to_string();
+    // A command list that repeats the last one fanned out for the session
+    // (same set, any order) is dropped here, before the idle nudge and before
+    // the relay allocates a seq: no live event, no durable record, no seq
+    // hole. Devin re-sends its unchanged list every ~15 s.
+    if let agent_client_protocol::schema::v1::SessionUpdate::AvailableCommandsUpdate(update) =
+        &notification.update
+    {
+        if state
+            .lock()
+            .is_repeated_commands_update(&session_id, &update.available_commands)
+        {
+            return Ok(());
+        }
+    }
     // Any inbound session/update is agent activity — nudge the active turn's
     // idle deadline so a streaming turn never hits the idle timeout.
     // Best-effort: a no-op when no turn is active for this session. Admission
@@ -483,6 +499,11 @@ pub(super) async fn drive_connection(
     // the title, a native agent `session_info_update` is suppressed here (the
     // durable defense in `append_record` is the second layer).
     let notif_persistence = persistence.clone();
+    let native_subagents = profile.native_subagents;
+    let raw_sinks = sinks.clone();
+    let raw_agent_id = agent_id.clone();
+    let raw_state = driver_state.clone();
+    let raw_persistence = persistence.clone();
     let perm_sinks = sinks.clone();
     let perm_agent_id = agent_id.clone();
     let perm_state = driver_state.clone();
@@ -524,6 +545,29 @@ pub(super) async fn drive_connection(
     let connection_result = Client
         .builder()
         .name(format!("termul-acp-{agent_id}"))
+        // Before the typed handler: native subagent traffic is claimed and
+        // re-addressed to its chat; everything else passes on unchanged.
+        .on_receive_notification(
+            async move |raw: super::native_subagents::RawSessionUpdate, cx| {
+                let claimed = native_subagents
+                    && super::native_subagents::deliver_native_update(
+                        &raw_state,
+                        raw_persistence.as_ref(),
+                        &raw_sinks,
+                        &raw_agent_id,
+                        &raw.0,
+                    )
+                    .await?;
+                if claimed {
+                    return Ok(agent_client_protocol::Handled::Yes);
+                }
+                Ok(agent_client_protocol::Handled::No {
+                    message: (raw, cx),
+                    retry: false,
+                })
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .on_receive_notification(
             async move |notification: agent_client_protocol::schema::v1::SessionNotification,
                         _cx| {
@@ -548,7 +592,7 @@ pub(super) async fn drive_connection(
                     options,
                     ..
                 } = request;
-                let session_string = session_id.0.to_string();
+                let session_string = perm_state.lock().chat_session_for(session_id.0.as_ref());
                 if perm_state.lock().is_ephemeral(&session_string) {
                     let _ = responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
@@ -590,7 +634,7 @@ pub(super) async fn drive_connection(
                 // parked `Responder<serde_json::Value>` (mirroring permissions),
                 // fan out `acp:question_request`, and resolve the responder when
                 // the user answers via `acp_answer_question` / `answer_question`.
-                let session_string = request.session_id.clone();
+                let session_string = question_state.lock().chat_session_for(&request.session_id);
                 if question_state.lock().is_ephemeral(&session_string) {
                     let _ = responder.respond(serde_json::json!({
                         "cancelled": true,
@@ -610,6 +654,8 @@ pub(super) async fn drive_connection(
                     session_id: SessionId::new(session_string),
                     question_id,
                     question: request.question,
+                    allow_free_text: None,
+                    multi_select: None,
                     options: request
                         .options
                         .into_iter()
@@ -639,7 +685,9 @@ pub(super) async fn drive_connection(
                     CreateElicitationResponse, ElicitationAction, ElicitationMode, ElicitationScope,
                 };
                 let session_string = match request.scope() {
-                    ElicitationScope::Session(session) => session.session_id.0.to_string(),
+                    ElicitationScope::Session(session) => {
+                        elicit_state.lock().chat_session_for(session.session_id.0.as_ref())
+                    }
                     ElicitationScope::Request(_) => {
                         let Some(session_id) = elicit_state.lock().sole_active_turn_session() else {
                             log::warn!(

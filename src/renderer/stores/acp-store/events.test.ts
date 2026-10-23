@@ -73,6 +73,7 @@ const { addAgentChatTabSpy, setTabFocusedSessionIdSpy, workspaceStateRef } = vi.
   workspaceStateRef: {
     current: {
       root: { type: 'leaf', id: 'pane-1', tabs: [], activeTabId: null },
+      openChatSessionIds: new Set<string>(),
       removeTab: vi.fn(),
       remapAgentChatSession: vi.fn()
     }
@@ -100,7 +101,9 @@ vi.mock('@/stores/workspace-store', () => {
     getAllTreeRoots: (state: { root: PaneNodeLike }) => [state.root],
     findPaneContainingTab,
     agentChatTabId: (sessionId: string) => `chat-${sessionId}`,
+    getAgentChatSessionIdsInAllTrees: () => workspaceStateRef.current.openChatSessionIds,
     useWorkspaceStore: {
+      subscribe: () => () => {},
       getState: () => ({
         addAgentChatTab: addAgentChatTabSpy,
         removeTab: workspaceStateRef.current.removeTab,
@@ -158,8 +161,10 @@ import {
   _resetInFlightPreparedForTesting,
   _resetLiveSwitchSourcesForTesting,
   _resetSessionIndexLoadGenerationForTesting,
+  initAcpEventListeners,
   useAcpStore
 } from '@/stores/acp-store'
+import { useAgentChatUnreadStore } from '@/stores/agent-chat-unread-store'
 import { FRESH, flushTurnEnd, seedSession } from './testkit'
 
 describe('acp-store', () => {
@@ -182,6 +187,7 @@ describe('acp-store', () => {
     _resetSessionIndexLoadGenerationForTesting()
     _resetHistorySeqWatermarksForTesting()
     _resetLiveSwitchSourcesForTesting()
+    workspaceStateRef.current.openChatSessionIds.clear()
     useAcpStore.setState(FRESH)
   })
 
@@ -437,6 +443,72 @@ describe('acp-store', () => {
     expect(useAcpStore.getState().sessions['s1'].activeTurn).toBe(false)
   })
 
+  it('agent_disconnected cancels subagents the host still marked running', () => {
+    seedSession('s1', 'agent-1', false)
+    useAcpStore.setState({
+      messages: {
+        s1: [
+          {
+            id: 'm1',
+            role: 'user',
+            blocks: [{ type: 'text', text: 'hi' }],
+            timestamp: 1
+          }
+        ]
+      },
+      toolCalls: {
+        s1: [
+          {
+            toolCallId: 'termul-subagent:child-1',
+            status: 'in_progress',
+            rawInput: { description: 'Review', prompt: 'p' },
+            subagentLifecycle: { state: 'running', agentId: 'child-1' }
+          }
+        ]
+      }
+    })
+    useAcpStore.getState()._onAgentDisconnected({ agentId: 'agent-1', reason: 'crashed' })
+    expect(useAcpStore.getState().toolCalls.s1?.[0]?.subagentLifecycle?.state).toBe('cancelled')
+  })
+
+  it('session close applies a buffered tool update before cancelling running subagents', () => {
+    seedSession('s1', 'agent-1', false)
+    workspaceStateRef.current.openChatSessionIds.add('s1')
+    useAcpStore.setState({
+      messages: {
+        s1: [
+          {
+            id: 'm1',
+            role: 'user',
+            blocks: [{ type: 'text', text: 'hi' }],
+            timestamp: 1
+          }
+        ]
+      },
+      toolCalls: {
+        s1: [
+          {
+            toolCallId: 'termul-subagent:child-1',
+            status: 'in_progress',
+            rawInput: { description: 'Review', prompt: 'p' }
+          }
+        ]
+      }
+    })
+    useAcpStore.getState()._onToolCallUpdate({
+      agentId: 'agent-1',
+      sessionId: 's1',
+      update: {
+        toolCallId: 'termul-subagent:child-1',
+        _meta: { 'termul/subagent': { state: 'running', sessionId: 'child-1' } }
+      }
+    })
+    useAcpStore
+      .getState()
+      ._onSessionClosed({ agentId: 'agent-1', sessionId: 's1', reason: 'closed' })
+    expect(useAcpStore.getState().toolCalls.s1?.[0]?.subagentLifecycle?.state).toBe('cancelled')
+  })
+
   it.each([
     'killed',
     'reaped',
@@ -677,6 +749,74 @@ describe('acp-store', () => {
     seed('q-3')
     store._onAgentDisconnected({ agentId: 'agent-1', reason: 'crashed' })
     expect(useAcpStore.getState().pendingQuestions['q-3']).toBeUndefined()
+  })
+
+  it('question_cancelled withdraws only that question mid-turn (issue #784)', () => {
+    const listeners = new Map<string, (payload: unknown, eventSeq?: number) => void>()
+    _setAcpTransportForTests({
+      onEvent: vi.fn((name: string, cb: (payload: unknown, eventSeq?: number) => void) => {
+        listeners.set(name, cb)
+        return () => {}
+      }),
+      setReconnectListener: vi.fn(),
+      setRecoveryHandler: vi.fn(),
+      setReconnectPriorityProvider: vi.fn(),
+      dispose: vi.fn()
+    } as unknown as AcpTransport)
+    seedSession('s1', 'agent-1')
+    const teardown = initAcpEventListeners()
+    try {
+      const ask = (questionId: string) =>
+        listeners.get('acp:question_request')!({
+          agentId: 'agent-1',
+          sessionId: 's1',
+          questionId,
+          question: 'Ship it?',
+          options: [{ value: 'Yes', label: 'Yes' }]
+        })
+      ask('q-1')
+      ask('q-2')
+      listeners.get('acp:question_cancelled')?.({
+        agentId: 'agent-1',
+        sessionId: 's1',
+        questionId: 'q-1'
+      })
+      expect(Object.keys(useAcpStore.getState().pendingQuestions)).toEqual(['q-2'])
+    } finally {
+      teardown()
+    }
+  })
+
+  it('notes a live turn end at the log epoch of the session cursor (cross-surface unread)', async () => {
+    const listeners = new Map<string, (payload: unknown, eventSeq?: number) => void>()
+    _setAcpTransportForTests({
+      onEvent: vi.fn((name: string, cb: (payload: unknown, eventSeq?: number) => void) => {
+        listeners.set(name, cb)
+        return () => {}
+      }),
+      getSessionCursor: (sessionId: string) =>
+        sessionId === 's1' ? { lastSeq: 7, logEpoch: 'epoch-live' } : null,
+      setReconnectListener: vi.fn(),
+      setRecoveryHandler: vi.fn(),
+      setReconnectPriorityProvider: vi.fn(),
+      dispose: vi.fn()
+    } as unknown as AcpTransport)
+    useAgentChatUnreadStore.setState({ seenTurnEnd: {} })
+    seedSession('s1', 'agent-1')
+    const teardown = initAcpEventListeners()
+    try {
+      listeners.get('acp:prompt_complete')?.(
+        { agentId: 'agent-1', sessionId: 's1', stopReason: 'end_turn' },
+        7
+      )
+      await flushTurnEnd()
+
+      expect(useAgentChatUnreadStore.getState().seenTurnEnd).toEqual({
+        s1: { logEpoch: 'epoch-live', seq: 7 }
+      })
+    } finally {
+      teardown()
+    }
   })
 
   it('answerQuestion is re-entrancy safe: second call is a no-op (issue #411)', async () => {

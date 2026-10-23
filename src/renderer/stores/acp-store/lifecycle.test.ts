@@ -152,6 +152,7 @@ import {
   setCachedSessionPayload
 } from '@/lib/acp-history-persistence'
 import { _resetAcpTransportForTests, AcpTransportError } from '@/lib/acp-transport'
+import { ACP_STREAM_INTERRUPT_MESSAGE } from '@/lib/agents/acp-spawn-errors'
 import { logFrontendError } from '@/lib/log-api'
 import {
   _resetAcpAuthForTesting,
@@ -215,7 +216,7 @@ describe('failed session lifecycle (story 5)', () => {
     // can retry, with the launch config recorded for the retry.
     expect(session.status).toBe('error')
     expect(session.launchConfigId).toBe('cfg-1')
-    expect(session.lastError).toContain('connection refused by agent')
+    expect(session.lastError).toContain(ACP_STREAM_INTERRUPT_MESSAGE)
     expect(state.launchingSessionIds[placeholderId]).toBeUndefined()
     // The sidebar projection gains a 'error'-status row instead of showing
     // "No chats yet" while the failed tab is open.
@@ -344,6 +345,48 @@ describe('failed session lifecycle (story 5)', () => {
     expect(real.status).toBe('error')
     expect(real.lastError).toBe('turn exploded')
     expect(real.launchConfigId).toBeUndefined()
+  })
+
+  it('gh-821: a rejected first prompt keeps the code and data of its agent error', async () => {
+    await useAcpStore
+      .getState()
+      .saveAgentConfig({ id: 'cfg-1', name: 'Gemini', command: 'gemini', args: [], env: {} })
+    const placeholderId = useAcpStore.getState().createLaunchPlaceholder({
+      cwd: '/work',
+      projectId: 'p1',
+      initialUserBlocks: [{ type: 'text', text: 'hello agent' }]
+    })
+    ;(invoke as ReturnType<typeof vi.fn>).mockImplementation(async (command: string) => {
+      if (command === 'acp_spawn_agent')
+        return { agentId: 'agent-1', capabilities: {}, authMethods: [] }
+      if (command === 'acp_new_session') return { sessionId: 'sess-real' }
+      if (command === 'acp_send_prompt') {
+        useAcpStore.getState()._onAgentError({
+          agentId: 'agent-1',
+          sessionId: 'sess-real',
+          message: 'Internal error',
+          code: -32603,
+          data: { reason: 'login' }
+        })
+        throw new Error('Internal error: login')
+      }
+      throw new Error(`unexpected invoke command: ${command}`)
+    })
+    await expect(
+      useAcpStore.getState().finalizeChatLaunch({
+        placeholderId,
+        configId: 'cfg-1',
+        cwd: '/work',
+        projectId: 'p1',
+        initialBlocks: [{ type: 'text', text: 'hello agent' }]
+      })
+    ).rejects.toThrow('Internal error: login')
+
+    const real = useAcpStore.getState().sessions['sess-real']
+    expect(real.status).toBe('error')
+    expect(real.lastError).toBe('Internal error: login')
+    expect(real.lastErrorCode).toBe(-32603)
+    expect(real.lastErrorData).toEqual({ reason: 'login' })
   })
 
   it('LAUNCH_FAIL: an ENOENT spawn failure carries command-specific guidance', async () => {
@@ -857,5 +900,85 @@ describe('failed session lifecycle (story 5)', () => {
     expect(addAgentChatTabSpy).toHaveBeenCalledWith('s-p1')
     expect(addAgentChatTabSpy).not.toHaveBeenCalledWith('s-p2')
     expect(takeAllDroppedLaunchPlaceholders()).toEqual([{ projectId: 'p2', count: 1 }])
+  })
+
+  describe('sends during a launch', () => {
+    type SentPrompt = { agentId: string; sessionId: string }
+
+    async function startGatedLaunch(initialText?: string): Promise<{
+      placeholderId: string
+      sent: SentPrompt[]
+      release: () => void
+      launch: Promise<unknown>
+    }> {
+      await useAcpStore
+        .getState()
+        .saveAgentConfig({ id: 'cfg-1', name: 'Gemini', command: 'gemini', args: [], env: {} })
+      const placeholderId = useAcpStore.getState().createLaunchPlaceholder({
+        cwd: '/work',
+        projectId: 'p1',
+        initialUserBlocks: initialText ? [{ type: 'text', text: initialText }] : undefined
+      })
+      let releaseCreate!: (value: { sessionId: string }) => void
+      const createGate = new Promise<{ sessionId: string }>((resolve) => {
+        releaseCreate = resolve
+      })
+      const sent: SentPrompt[] = []
+      ;(invoke as ReturnType<typeof vi.fn>).mockImplementation(
+        async (command: string, args?: SentPrompt) => {
+          if (command === 'acp_spawn_agent')
+            return { agentId: 'agent-1', capabilities: {}, authMethods: [] }
+          if (command === 'acp_new_session') return createGate
+          if (command === 'acp_send_prompt' && args) {
+            sent.push({ agentId: args.agentId, sessionId: args.sessionId })
+            return 'end_turn'
+          }
+          return undefined
+        }
+      )
+      const launch = useAcpStore.getState().finalizeChatLaunch({
+        placeholderId,
+        configId: 'cfg-1',
+        cwd: '/work',
+        projectId: 'p1',
+        initialText
+      })
+      await vi.waitFor(() =>
+        expect(invoke).toHaveBeenCalledWith('acp_new_session', expect.anything())
+      )
+      return {
+        placeholderId,
+        sent,
+        release: () => releaseCreate({ sessionId: 'sess-real' }),
+        launch
+      }
+    }
+
+    it('queues a send made before the agent binds and delivers it to the real session', async () => {
+      const { placeholderId, sent, release, launch } = await startGatedLaunch()
+      await useAcpStore.getState().sendPrompt(placeholderId, 'early message')
+      expect(sent).toEqual([])
+      expect(useAcpStore.getState().promptQueues[placeholderId]?.map((q) => q.blocks)).toEqual([
+        [{ type: 'text', text: 'early message' }]
+      ])
+
+      release()
+      await launch
+      await vi.waitFor(() => expect(sent).toEqual([{ agentId: 'agent-1', sessionId: 'sess-real' }]))
+      expect(useAcpStore.getState().promptQueues[placeholderId]).toBeUndefined()
+    })
+
+    it('carries a send queued behind the first prompt onto the real session', async () => {
+      const { placeholderId, sent, release, launch } = await startGatedLaunch('first message')
+      await useAcpStore.getState().sendPrompt(placeholderId, 'second message')
+
+      release()
+      await launch
+      expect(sent).toEqual([{ agentId: 'agent-1', sessionId: 'sess-real' }])
+      expect(useAcpStore.getState().promptQueues['sess-real']?.map((q) => q.blocks)).toEqual([
+        [{ type: 'text', text: 'second message' }]
+      ])
+      expect(useAcpStore.getState().promptQueues[placeholderId]).toBeUndefined()
+    })
   })
 })

@@ -6,14 +6,17 @@ mod agent_registry;
 mod agentation;
 mod browser_automation;
 mod browser_tab_manager;
-// OpenPencil canvas mode (spec-openpencil-canvas-mode): shared, Tauri-free
-// daemon pool + proxies. Compiled unconditionally so the standalone
-// `termul-server` (server_main.rs) constructs its own pool too.
+// Canvas mode: shared, Tauri-free bundle server + persistence. Compiled
+// unconditionally so the standalone `termul-server` mounts the same routes.
 pub mod canvas;
+mod commands;
 // One host per durable path (AD-14): sidecar `File::try_lock` locks taken before
 // any store opens. Tauri-free so the desktop and `termul-server` share it.
 pub mod data_lock;
-mod commands;
+// Bug-report diagnostics bundle + `gh` submit: Tauri-free core so the
+// desktop and `termul-server` share it (like `data_lock`/`server_update`).
+pub mod diagnostics;
+mod exit_cleanup;
 mod logging;
 mod migrations;
 mod path_validation;
@@ -44,6 +47,10 @@ mod updater_api;
 pub mod web;
 // Main-window show safety net + Wayland detection (gh-719).
 mod window_visibility;
+// Main-window WebView2 crash recovery; the pure decision logic is also
+// compiled for tests so it runs on every CI platform.
+#[cfg(any(target_os = "windows", test))]
+mod webview_recovery;
 mod worktree;
 
 #[cfg(target_os = "windows")]
@@ -1022,6 +1029,46 @@ static CLEANUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 // returns immediately via the check above.
 static CLEANUP_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+// Set by `request_restart_after_cleanup`; read by `finish_exit` only once the
+// exit cleanup has finished, so a recovery restart relaunches after the same
+// PTY/ACP/canvas/WS drain and history flush as a normal quit.
+static RESTART_AFTER_CLEANUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True once an exit (quit or recovery restart) has claimed the cleanup path.
+#[cfg(target_os = "windows")]
+pub(crate) fn exit_cleanup_in_progress() -> bool {
+    CLEANUP_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Requests a graceful restart: the normal exit cleanup runs first, then
+/// `finish_exit` relaunches. `AppHandle::request_restart()` cannot be used
+/// directly because tauri ignores `prevent_exit` for `RESTART_EXIT_CODE`, so
+/// the async cleanup would be skipped.
+#[cfg(target_os = "windows")]
+pub(crate) fn request_restart_after_cleanup(app: &tauri::AppHandle) -> bool {
+    // A quit that already claimed the exit wins: flagging a restart now would
+    // turn the user's quit into a relaunch.
+    if exit_cleanup_in_progress() {
+        log::warn!("[webview-recovery] restart dropped: exit already in progress");
+        return false;
+    }
+    RESTART_AFTER_CLEANUP.store(true, std::sync::atomic::Ordering::SeqCst);
+    app.exit(0);
+    true
+}
+
+/// Ends the process after the exit cleanup: relaunches when a restart was
+/// requested, otherwise exits with code 0. `CLEANUP_DONE` is already set, so
+/// the `ExitRequested` either call raises returns early.
+fn finish_exit(app: &tauri::AppHandle) {
+    if RESTART_AFTER_CLEANUP.load(std::sync::atomic::Ordering::SeqCst) {
+        log::warn!("[exit] cleanup finished; relaunching (restart requested)");
+        app.request_restart();
+    } else {
+        app.exit(0);
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1241,6 +1288,17 @@ pub fn run() {
                     }
                 }
             }
+            // Reload the main webview after a render-process crash/hang and
+            // restart once (after the exit cleanup) if WebView2 cannot recover.
+            #[cfg(target_os = "windows")]
+            match app.get_webview_window("main") {
+                Some(window) => {
+                    if let Err(e) = webview_recovery::install(&handle, &window) {
+                        log::warn!("[webview-recovery] failed to attach to the main window: {e}");
+                    }
+                }
+                None => log::warn!("[webview-recovery] no main window; crash recovery not attached"),
+            }
 
             app.manage(ViewMenuState::default());
 
@@ -1277,13 +1335,12 @@ pub fn run() {
             Arc::new(browser_tab_manager::BrowserTabManager::new(handle.clone()));
             app.manage(browser_tab_manager.clone());
 
-            // OpenPencil canvas mode: the shared daemon pool. Tauri-free so
-            // the standalone server composes it too; the desktop's four
-            // canvas_* commands drive it and the agentation HTTP server
-            // mounts /canvas/mcp against it (must exist BEFORE the
-            // agentation service starts).
-            let canvas_pool = Arc::new(crate::canvas::pool::CanvasDaemonPool::real());
-            app.manage(canvas_pool.clone());
+            // figcraft canvas bundle: the 127.0.0.1:0 static listener the
+            // canvas iframe loads from (restarted if it dies).
+            crate::canvas::static_server::log_bundle_status();
+            let canvas_static_server = crate::canvas::static_server::StaticServer::new();
+            app.manage(canvas_static_server.clone());
+            tauri::async_runtime::spawn(canvas_static_server.run());
 
             // Load persisted agentation enabled preference (issue #451 CodeRabbit).
             // Falls back to true (enabled by default) when no stored value exists.
@@ -1304,10 +1361,7 @@ pub fn run() {
                     .app_data_dir()
                     .map_err(|e| format!("agentation: app_data_dir: {e}"))?;
                 let db_path = agentation::db_path(&app_data);
-                match tauri::async_runtime::block_on(agentation::AgentationService::start(
-                    &db_path,
-                    Some(canvas_pool.clone()),
-                )) {
+                match tauri::async_runtime::block_on(agentation::AgentationService::start(&db_path)) {
                     Ok(service) => {
                         let port = service.http_port();
                         let endpoint = format!("http://127.0.0.1:{port}");
@@ -1356,14 +1410,16 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| format!("failed to resolve app data directory: {error}"))?
                 .join("acp-sessions");
+            let persistence_started = std::time::Instant::now();
             let session_persistence =
                 match tauri::async_runtime::block_on(SessionPersistence::open(
                     sessions_root.clone(),
                 )) {
                     Ok(persistence) => {
                         log::info!(
-                            "[acp-history] host persistence ready path={}",
-                            persistence.root().display()
+                            "[acp-history] host persistence ready path={} elapsed_ms={}",
+                            persistence.root().display(),
+                            persistence_started.elapsed().as_millis()
                         );
                         Some(persistence)
                     }
@@ -1541,9 +1597,16 @@ pub fn run() {
             // The one host-owned idle-agent reaper for the desktop process
             // (probe-based; see `web::agent_reaper`). Never started from
             // `serve_router`, whose shared-live toggle reuses these agents.
+            // `$TERMUL_AGENT_IDLE_REAP_SECS` wins; otherwise App Preferences
+            // can change the window on the next sweep.
+            let idle_window = web::config::desktop_agent_idle_window_secs();
+            web::agent_reaper::install_agent_idle_baseline(
+                idle_window.secs,
+                idle_window.from_env.then_some("env"),
+            );
             app.manage(Arc::new(web::agent_reaper::AgentReaperHandle::start(
                 Arc::clone(&acp_manager),
-                std::time::Duration::from_secs(web::config::DEFAULT_AGENT_IDLE_WINDOW_SECS),
+                web::agent_reaper::live_agent_idle_window,
                 tauri::async_runtime::handle().inner(),
             )));
 
@@ -1747,6 +1810,7 @@ pub fn run() {
             // Terminal commands
             commands::terminal_spawn,
             commands::terminal_attach,
+            commands::terminal_list_preserved,
             commands::terminal_rotate_claim,
             commands::terminal_revoke_claim,
             commands::terminal_write,
@@ -1867,7 +1931,6 @@ pub fn run() {
             commands::git_stash_drop,
             commands::git_branch_list,
             commands::git_branch_switch,
-            commands::git_branch_create,
             // Project icon resolution (local file scan → git-remote fetch)
             commands::project_icon_resolve,
             // Secure storage commands
@@ -1896,6 +1959,8 @@ pub fn run() {
             acp::commands::acp_set_turn_idle_timeout,
             acp::commands::acp_set_session_new_timeout,
             acp::commands::acp_set_session_reopen_timeout,
+            acp::commands::acp_set_agent_idle_window,
+            acp::commands::acp_get_agent_idle_window,
             acp::commands::acp_probe_mcp_server,
             acp::commands::acp_mcp_oauth_start,
             acp::commands::acp_mcp_oauth_has_token,
@@ -1908,6 +1973,7 @@ pub fn run() {
             // Agent Skills (Zed-compatible SKILL.md packages)
             skills::commands::list_agent_skills_cmd,
             skills::commands::read_agent_skill_cmd,
+            skills::commands::list_skill_files_cmd,
             // Remote server commands
             commands::remote_server_start,
             commands::remote_server_stop,
@@ -1927,6 +1993,10 @@ pub fn run() {
             commands::acp_history_get_legacy,
             // Frontend error forwarding (issue #244)
             commands::log_frontend_error,
+            // Bug-report diagnostics + host-side `gh` submit
+            // (spec-bug-report-dialog); mirrors the `/log/*` web routes.
+            commands::collect_bug_report_context,
+            commands::submit_bug_report,
             // Agentation annotation service (issue #451, Epic 1)
             agentation::agentation_create_session,
             agentation::agentation_list_sessions,
@@ -1939,11 +2009,17 @@ pub fn run() {
             agentation::agentation_reply,
             agentation::agentation_set_enabled,
             agentation::agentation_is_enabled,
-            // OpenPencil canvas mode (managed sidecar daemon lifecycle)
+            // Canvas mode (figcraft editor mount and persistence)
             commands::canvas_open,
             commands::canvas_close,
-            commands::canvas_save,
-            commands::canvas_status,
+            commands::canvas_read_document,
+            commands::canvas_document_loaded,
+            commands::canvas_dirty_changed,
+            commands::canvas_set_visible,
+            commands::canvas_write_snapshot,
+            commands::canvas_disk_changed,
+            commands::canvas_resolve_conflict,
+            commands::canvas_crashed,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -1996,67 +2072,30 @@ pub fn run() {
                 .try_state::<web::ws::channel::WsChannelHost>()
                 .map(|state| state.inner().clone());
 
-            // OpenPencil canvas mode: join the daemon pool shutdown (stdin
-            // EOF → kill) in the exit cleanup so no op-host-web-server
-            // process outlives the app.
-            let canvas_pool = app_handle
-                .try_state::<Arc<crate::canvas::pool::CanvasDaemonPool>>()
+            let pty_manager = app_handle
+                .try_state::<Arc<PtyManager>>()
                 .map(|state| state.inner().clone());
-
-            if let Some(pty_manager) = app_handle.try_state::<Arc<PtyManager>>() {
-                let pty_manager_clone = pty_manager.inner().clone();
-                let app_handle_clone = app_handle.clone();
-
-                // Spawn async cleanup task via tauri::async_runtime
-                // (not tokio::spawn directly — the run callback may fire on
-                // a thread without a Tokio reactor, e.g. macOS WKWebView events)
-                tauri::async_runtime::spawn(async move {
-                    if let Some(ssh_manager) = ssh_manager {
-                        ssh_manager.shutdown().await;
-                    }
-                    if let Some(remote_state) = remote_state {
-                        let _ = remote_state.stop().await;
-                    }
-                    if let Some(ws_channel_host) = &ws_channel_host {
-                        ws_channel_host.drain().await;
-                    }
-                    pty_manager_clone.kill_all().await;
-                    if let Some(canvas_pool) = canvas_pool {
-                        canvas_pool.shutdown_all().await;
-                    }
-                    if let Some(acp_manager) = acp_manager {
-                        // When persistence is available, kill_all stops agents
-                        // and leaves session writers installed. shutdown_persistence
-                        // drains them, appends the interrupted marker for an open
-                        // turn, and persists status closed. A single-agent kill
-                        // does not take this path.
-                        if let Some(agent_reaper) = &agent_reaper {
-                            agent_reaper.stop().await;
-                        }
-                        acp_manager.kill_all().await;
-                        if let Err(error) = acp_manager.shutdown_persistence().await {
-                            log::error!(
-                                "[acp-history] persistence shutdown failed at exit: {error}"
-                            );
-                        }
-                    }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    // Mark cleanup as done so the subsequent exit event isn't prevented
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // After cleanup completes, allow the app to exit with code 0
-                    app_handle_clone.exit(0);
-                });
-            } else if let Some(acp_manager) = acp_manager {
-                let app_handle_clone = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(ws_channel_host) = &ws_channel_host {
-                        ws_channel_host.drain().await;
-                    }
-                    if let Some(canvas_pool) = canvas_pool {
-                        canvas_pool.shutdown_all().await;
-                    }
+            let preserve = async move {
+                // Figcraft canvases save through their renderer (AD-31), so
+                // this runs while the Channel and remote sockets are still up.
+                // The quit dialog already flushed them; this catches an exit
+                // that skipped it.
+                crate::canvas::static_server::close_all_canvases_bounded().await;
+                if let Some(ssh_manager) = ssh_manager {
+                    ssh_manager.shutdown().await;
+                }
+                if let Some(remote_state) = remote_state {
+                    let _ = remote_state.stop().await;
+                }
+                if let Some(ws_channel_host) = &ws_channel_host {
+                    ws_channel_host.drain().await;
+                }
+                if let Some(acp_manager) = acp_manager {
+                    // When persistence is available, kill_all stops agents
+                    // and leaves session writers installed. shutdown_persistence
+                    // drains them, appends the interrupted marker for an open
+                    // turn, and persists status closed. A single-agent kill
+                    // does not take this path.
                     if let Some(agent_reaper) = &agent_reaper {
                         agent_reaper.stop().await;
                     }
@@ -2064,32 +2103,29 @@ pub fn run() {
                     if let Err(error) = acp_manager.shutdown_persistence().await {
                         log::error!("[acp-history] persistence shutdown failed at exit: {error}");
                     }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    app_handle_clone.exit(0);
-                });
-            } else {
-                let app_handle_clone = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(ssh_manager) = ssh_manager {
-                        ssh_manager.shutdown().await;
-                    }
-                    if let Some(remote_state) = remote_state {
-                        let _ = remote_state.stop().await;
-                    }
-                    if let Some(canvas_pool) = canvas_pool {
-                        canvas_pool.shutdown_all().await;
-                    }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // No PTY or ACP manager, just exit
-                    app_handle_clone.exit(0);
-                });
-            }
+                }
+            };
+            let teardown = async move {
+                if let Some(pty_manager) = pty_manager {
+                    pty_manager.kill_all().await;
+                }
+                if let Some(browser_tab_manager) = browser_tab_manager {
+                    browser_tab_manager.destroy_all();
+                }
+            };
+            let app_handle_clone = app_handle.clone();
+            // tauri::async_runtime, not tokio::spawn: the run callback may fire
+            // on a thread without a Tokio reactor (e.g. macOS WKWebView events).
+            tauri::async_runtime::spawn(async move {
+                exit_cleanup::run_exit_cleanup(
+                    preserve,
+                    teardown,
+                    exit_cleanup::EXIT_CLEANUP_TIMEOUT,
+                )
+                .await;
+                CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                finish_exit(&app_handle_clone);
+            });
         }
     });
 }
@@ -2097,3 +2133,6 @@ pub fn run() {
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod fs_watch_wire_tests;

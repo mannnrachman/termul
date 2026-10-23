@@ -97,6 +97,13 @@ or refreshes the login tokens; Claude Code keeps them in its own credential
 store. The Account list (`<state dir>/claude-accounts.json`) holds names and
 ids only.
 
+When a Project's Account changes, each open Claude chat restarts on the new
+Account and resumes the same session. If the new Account cannot find the
+session (the agent answers `session/resume` with `Resource not found`), the
+chat continues in a new session. That session starts from a summary of the
+conversation, the same handoff as an agent switch, and the earlier messages
+stay above a handoff divider.
+
 Headless hosts manage Accounts with:
 
 ```sh
@@ -144,6 +151,26 @@ signed-in state) and their usage, and choose the Default or a Project Account
 (`list_claude_accounts`, `list_claude_usage`, `set_default_claude_account`,
 `set_project_claude_account`); view-only connections can only list. Adding,
 signing in, renaming and removing an Account stay on the host.
+
+## Per-project Claude profiles
+
+The agent process runs with the project's environment variables (Project
+Settings → Environment Variables) underneath the agent config's own env. Set
+`CLAUDE_CONFIG_DIR` on a project to pin its agent chats, like its terminal
+tabs, to one Claude Code login.
+
+The agent's `CLAUDE_CONFIG_DIR` is chosen once and used by both the
+`claude auth status` preflight and the agent process:
+
+1. `CLAUDE_CONFIG_DIR` in the agent env (the project env, or the agent config).
+2. Otherwise the config dir of the project's linked Claude Account.
+3. Otherwise the host's own Claude config dir.
+
+The host logs which of the three it used, and when a project env value
+overrides a linked Account, without logging the path.
+
+Changing a project's env gives the next chat a fresh agent. The previous agent
+keeps serving its open chats and running work until the idle reaper stops it.
 
 ## Startup failures
 

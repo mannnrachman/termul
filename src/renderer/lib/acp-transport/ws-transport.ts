@@ -18,6 +18,7 @@ import {
   type AcpAuthenticateReply,
   type AcpRuntimePolicy,
   type AddProjectPayload,
+  type ChatReadMark,
   type DeleteSessionPayload,
   type HistoryMode,
   type PersistedSessionSummary,
@@ -26,10 +27,14 @@ import {
   type SessionSnapshotEvent,
   type SessionSubscribeReply,
   type UpdateProjectPayload,
+  WS_CANVAS_CALL_FRAME_TYPE,
+  WS_CANVAS_LEASE_LOST_FRAME_TYPE,
   WS_ERROR_CODES,
   WS_EVENT_TYPES,
   WS_WATCH_FRAME_TYPE,
   type WsAgentSummary,
+  type WsCanvasCallFrame,
+  type WsCanvasLeaseLostFrame,
   type WsEvent,
   type WsReply,
   type WsRequest,
@@ -50,6 +55,7 @@ import type {
   NewSessionOutcome,
   ProbeResult,
   PromptDispatchResult,
+  RegistryCheckReason,
   SessionConfigOption,
   SessionId,
   SessionReopenOutcome,
@@ -57,6 +63,7 @@ import type {
 } from '@/lib/acp-api'
 import type { SessionPayload } from '@/lib/acp-history-persistence'
 import type { AcpRuntimeAvailability } from '@/lib/agents/supported-acp-agents'
+import { getJson, postJson } from '@/lib/ipc/http'
 import { logFrontendError } from '@/lib/log-api'
 import { randomUUID } from '@/lib/uuid'
 import { flagWebAuthUnauthorized, getWebAuthGateState } from '@/lib/web-auth-gate'
@@ -67,6 +74,7 @@ import {
   handleProtocolVersionMismatch
 } from '@/lib/web-protocol-reload'
 import { webServerMcpProbe } from '@/lib/web-server-api'
+import { CanvasGatewayClient } from './canvas-gateway-client'
 import { judgeEvent, SyncGate } from './cursor'
 import { toWsEventType } from './event-names'
 import { HOST_GOING_AWAY_CLOSE_CODE, HostOfflineMonitor } from './host-offline'
@@ -75,9 +83,11 @@ import {
   type AcpConnectionState,
   type AcpTransport,
   AcpTransportError,
+  type AgentIdleWindowStatus,
   COMMAND_IN_PROGRESS_CODE,
   type CommandCallOptions,
   parseVisibleAt,
+  type ReopenCallOptions,
   type SessionCursor
 } from './types'
 import { WatchClient } from './watch-client'
@@ -258,6 +268,11 @@ export class WsAcpTransport implements AcpTransport {
    */
   readonly watches = new WatchClient({
     request: (type, payload, timeoutMs) => this.request(type, payload, timeoutMs),
+    isLive: () => this.isSocketLive()
+  })
+  /** The canvas gateway's renderer leg: mount reports and forwarded calls. */
+  readonly canvas = new CanvasGatewayClient({
+    request: (type, payload) => this.request(type, payload),
     isLive: () => this.isSocketLive()
   })
   /** Idempotent prompt_complete turn ids already delivered, scoped by session. */
@@ -853,38 +868,27 @@ export class WsAcpTransport implements AcpTransport {
     // the session reopen timeout via TERMUL_ACP_SESSION_REOPEN_TIMEOUT_SECS.
   }
 
-  /**
-   * CAP-6 / Story 8: fetchRegistrySnapshot is replaced by the host-resolved
-   * catalog. The web client calls `acpCatalogApi.listCatalog()` (the facade)
-   * which returns the host's resolved catalog including CDN entries (when
-   * the opt-in is set). This method now delegates to the WS
-   * `list_acp_catalog` request; the fake `{agents:[]}` hardcoded stub is
-   * removed. Callers that need the full catalog (the registry-catalog hook)
-   * switch to `acpCatalogApi.listCatalog()` instead.
-   */
-  async fetchRegistrySnapshot(forceRefresh = false): Promise<AcpRegistrySnapshot> {
-    // Delegate to the host-resolved catalog. The host embeds the trusted
-    // bundled `agents.json` + optionally augments with the CDN snapshot
-    // (gated on the host-persisted opt-in). This replaces the fake
-    // `{agents:[], source:'empty'}` hardcoded stub.
-    //
-    // The WS `list_acp_catalog` payload field is `refresh` (camelCase, matching
-    // the Rust `ListAcpCatalogPayload.refresh` + the HTTP `?refresh=true` query).
-    // Propagate `forceRefresh` so an explicit user refresh bypasses the host's
-    // 60s TTL — the previous `{}` left `refresh` defaulted to `false`, so a
-    // "check for updates" action could serve a stale cached catalog.
-    try {
-      const catalog = await this.request<AcpCatalogFromHost>('list_acp_catalog', {
-        refresh: forceRefresh
-      })
-      return {
-        agents: catalog.agents,
-        source: 'network',
-        fetchedAt: null
-      }
-    } catch {
-      return { agents: [], source: 'empty', fetchedAt: null }
+  async setAgentIdleWindow(secs: number | null): Promise<void> {
+    const res = await postJson<AgentIdleWindowStatus>('/host/agent-idle-window', { secs })
+    if (!res.success) {
+      throw new AcpTransportError(res.code, res.error)
     }
+  }
+
+  async getAgentIdleWindow(): Promise<AgentIdleWindowStatus> {
+    const res = await getJson<AgentIdleWindowStatus>('/host/agent-idle-window')
+    if (!res.success || res.data == null) {
+      throw new AcpTransportError(
+        res.success ? 'NETWORK_ERROR' : res.code,
+        res.success ? 'agent idle window response had no data' : res.error
+      )
+    }
+    return res.data
+  }
+
+  /** `fetch_acp_registry_snapshot`: the host's registry check (desktop: `acp_fetch_registry_snapshot`). */
+  fetchRegistrySnapshot(reason: RegistryCheckReason): Promise<AcpRegistrySnapshot> {
+    return this.request<AcpRegistrySnapshot>('fetch_acp_registry_snapshot', { reason })
   }
 
   // --- Agent lifecycle (desktop parity over WS) ----------------------------
@@ -1113,18 +1117,22 @@ export class WsAcpTransport implements AcpTransport {
     sessionId: SessionId,
     cwd: string,
     additionalDirectories?: string[],
-    options?: CommandCallOptions
+    options?: ReopenCallOptions
   ): Promise<SessionReopenOutcome> {
+    const { mcpServers, ...call } = options ?? {}
     const outcome = await this.request<SessionReopenOutcome>(
       'load_session',
       {
         agentId,
         sessionId,
         cwd,
-        ...(additionalDirectories?.length ? { additionalDirectories } : {})
+        ...(additionalDirectories?.length ? { additionalDirectories } : {}),
+        // Present only for a reload. An empty array still asks the host to
+        // attach the plan server. Omitted keeps a normal history reopen.
+        ...(mcpServers ? { mcpServers } : {})
       },
       undefined,
-      options
+      call
     )
     await this.subscribeSession(sessionId, this.lastSeq.get(sessionId) ?? 0, true)
     return outcome
@@ -1135,18 +1143,20 @@ export class WsAcpTransport implements AcpTransport {
     sessionId: SessionId,
     cwd: string,
     additionalDirectories?: string[],
-    options?: CommandCallOptions
+    options?: ReopenCallOptions
   ): Promise<SessionReopenOutcome> {
+    const { mcpServers, ...call } = options ?? {}
     const outcome = await this.request<SessionReopenOutcome>(
       'resume_session',
       {
         agentId,
         sessionId,
         cwd,
-        ...(additionalDirectories?.length ? { additionalDirectories } : {})
+        ...(additionalDirectories?.length ? { additionalDirectories } : {}),
+        ...(mcpServers ? { mcpServers } : {})
       },
       undefined,
-      options
+      call
     )
     await this.subscribeSession(sessionId, this.lastSeq.get(sessionId) ?? 0, true)
     return outcome
@@ -1202,6 +1212,18 @@ export class WsAcpTransport implements AcpTransport {
     options?: CommandCallOptions
   ): Promise<void> {
     await this.request('record_agent_switch', { sessionId, ...record }, undefined, options)
+  }
+
+  async markChatRead(
+    sessionId: SessionId,
+    seq: number,
+    logEpoch: string | null
+  ): Promise<ChatReadMark> {
+    return this.request<ChatReadMark>('mark_chat_read', {
+      sessionId,
+      seq,
+      ...(logEpoch ? { logEpoch } : {})
+    })
   }
 
   async sendPrompt(
@@ -2011,6 +2033,14 @@ export class WsAcpTransport implements AcpTransport {
       this.watches.handleFrame(obj as unknown as WsWatchFrame)
       return
     }
+    if (obj.type === WS_CANVAS_CALL_FRAME_TYPE) {
+      this.canvas.handleFrame(obj as unknown as WsCanvasCallFrame)
+      return
+    }
+    if (obj.type === WS_CANVAS_LEASE_LOST_FRAME_TYPE) {
+      this.canvas.handleLeaseLost(obj as unknown as WsCanvasLeaseLostFrame)
+      return
+    }
     if (obj.type === 'gap' && typeof obj.sid === 'string') {
       const gapSid = obj.sid
       // Queued behind the events already received so it lands in wire order.
@@ -2159,6 +2189,7 @@ export class WsAcpTransport implements AcpTransport {
         this.startStableTimer()
         // Every watch rebuilds from fresh full state on this socket.
         this.watches.onConnected()
+        this.canvas.onConnected()
         // CAP-3: if the tab is already hidden when auth completes (e.g. a
         // reconnect that finished while backgrounded), the hide event fired
         // before we were authed and was a no-op. Re-sync the server's watchdog

@@ -13,7 +13,6 @@ import {
 } from '@/lib/acp-mcp-persistence'
 import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
-import { getWebAuthToken } from '@/lib/web-auth-token'
 import { useProjectStore } from '@/stores/project-store'
 import type { AcpState } from '../types'
 
@@ -25,14 +24,6 @@ import type { AcpState } from '../types'
 // The queue guarantees each mutation reads, writes, and (on failure) rolls back
 // against the registry state as of its own turn.
 let mcpRegistryQueue: Promise<unknown> = Promise.resolve()
-
-/** Deterministic registry id for a project's canvas MCP entry (AD-5: one
- * persisted http entry per project, refreshed on every canvas open). */
-function canvasMcpServerId(projectId: string): string {
-  return `canvas-mcp-${projectId}`
-}
-
-const CANVAS_MCP_SERVER_NAME = 'OpenPencil Canvas'
 
 /** The project the host MCP file is addressed through (`''` until one is selected). */
 function activeProjectId(): string {
@@ -62,7 +53,6 @@ type McpSliceState = Pick<
   | 'importMcpServers'
   | 'setMcpServerEnabled'
   | 'deleteMcpServer'
-  | 'upsertCanvasMcpServer'
   | 'syncMcpRegistryToProjectFile'
   | 'probeMcpServer'
   | 'loadMcpTools'
@@ -76,7 +66,104 @@ type McpSliceState = Pick<
 // (mirroring the empty pre-load state would clobber the project's file).
 let projectFileMirrorPending: string | null = null
 
-export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (set, get) => ({
+function probeConfigOf(server: StoredMcpServer): McpServerConfig {
+  const { id: _id, enabled: _enabled, ...config } = server
+  return config as McpServerConfig
+}
+
+function sameProbeConfig(a: StoredMcpServer, b: StoredMcpServer): boolean {
+  return JSON.stringify(probeConfigOf(a)) === JSON.stringify(probeConfigOf(b))
+}
+
+type McpSliceCreator = StateCreator<AcpState, [], [], McpSliceState>
+
+type McpProbeState = Pick<
+  AcpState,
+  'mcpProbeStatus' | 'mcpTools' | 'mcpToolsLoaded' | 'mcpProbing' | 'mcpProbeError'
+>
+
+function omitKey<V>(record: Record<string, V>, id: string): Record<string, V> {
+  const { [id]: _dropped, ...rest } = record
+  return rest
+}
+
+function withoutProbeState(s: McpProbeState, id: string): McpProbeState {
+  return {
+    mcpProbeStatus: omitKey(s.mcpProbeStatus, id),
+    mcpTools: omitKey(s.mcpTools, id),
+    mcpToolsLoaded: omitKey(s.mcpToolsLoaded, id),
+    mcpProbing: omitKey(s.mcpProbing, id),
+    mcpProbeError: omitKey(s.mcpProbeError, id)
+  }
+}
+
+// Per-id count of completed deletions. Absence from `mcpServers` alone does not
+// mean deleted: a web project switch swaps in another project's list. A probe
+// or OAuth call compares the count across its await, so a deleted id's result
+// never lands, even on a server re-added under the same id.
+const deletionCounts = new Map<string, number>()
+
+export function mcpServerDeletionCount(id: string): number {
+  return deletionCounts.get(id) ?? 0
+}
+
+function deletionGuard(id: string): () => boolean {
+  const before = mcpServerDeletionCount(id)
+  return () => mcpServerDeletionCount(id) !== before
+}
+
+// Ids whose in-flight probe started before an OAuth sign-in or sign-out
+// finished, so its result is stale. The host joins identical in-flight probes,
+// so the fresh probe can only start once this one ends.
+const reprobeAfterInFlight = new Set<string>()
+
+function probeAfterInFlight(get: Parameters<McpSliceCreator>[1], id: string): Promise<void> {
+  if (get().mcpProbing[id]) {
+    reprobeAfterInFlight.add(id)
+    return Promise.resolve()
+  }
+  return get().probeMcpServer(id)
+}
+
+// Returns null when a finished probe of `probed` should write its result.
+// Otherwise the result is dropped: a server deleted mid-probe stays cleared,
+// and a server whose config was edited or whose OAuth state changed is
+// probed again.
+function settleStaleProbe(
+  set: Parameters<McpSliceCreator>[0],
+  get: Parameters<McpSliceCreator>[1],
+  probed: StoredMcpServer,
+  wasDeleted: () => boolean
+): Promise<void> | null {
+  const { id } = probed
+  const reprobe = reprobeAfterInFlight.delete(id)
+  const deleted = wasDeleted()
+  const current = get().mcpServers.find((s) => s.id === id)
+  if (!current) return deleted ? Promise.resolve() : null
+  if (!reprobe && sameProbeConfig(current, probed)) return null
+  set((s) => ({ mcpProbing: { ...s.mcpProbing, [id]: false } }))
+  if (current.enabled === false) return Promise.resolve()
+  return get().probeMcpServer(id)
+}
+
+function reprobeEditedServer(
+  set: Parameters<McpSliceCreator>[0],
+  get: Parameters<McpSliceCreator>[1],
+  server: StoredMcpServer
+): void {
+  set((s) => {
+    const { [server.id]: _stale, ...mcpProbeStatus } = s.mcpProbeStatus
+    return {
+      mcpProbeStatus,
+      mcpTools: { ...s.mcpTools, [server.id]: [] },
+      mcpToolsLoaded: { ...s.mcpToolsLoaded, [server.id]: false },
+      mcpProbeError: { ...s.mcpProbeError, [server.id]: undefined }
+    }
+  })
+  if (server.enabled !== false) void get().probeMcpServer(server.id)
+}
+
+export const createMcpSlice: McpSliceCreator = (set, get) => ({
   mcpServers: [],
   mcpServersLoaded: false,
   mcpProbeStatus: {},
@@ -125,6 +212,9 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
         })
         throw err
       }
+      const previous = list[idx]
+      if (previous && !sameProbeConfig(previous, nextServer))
+        reprobeEditedServer(set, get, nextServer)
     }),
 
   importMcpServers: async (servers) => {
@@ -178,86 +268,12 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
         })
         throw err
       }
-    }),
-
-  // OpenPencil canvas mode (CAP-2 / AD-5): one persisted http entry per
-  // project, upserted on every canvas open so the URL tracks the dynamic
-  // agentation port (desktop) or the web proxy. Preserves the user's
-  // `enabled` flag; the URL is refreshed. Serialized through the same
-  // registry queue as every other mutation — canvas-store never writes the
-  // persistence key directly.
-  //
-  // Credential (Authorization bearer) on BOTH surfaces: desktop uses the
-  // managed token from the canvas open response (`canvasToken` — the
-  // agentation canvas MCP routes are gated behind it); web uses the web-auth
-  // token (server-side agent clients pass the /canvas/mcp gate with it).
-  // The token is stored (it must reach the backend), never logged.
-  upsertCanvasMcpServer: (projectId, url, token) =>
-    runSerializedMcpRegistryMutation(async () => {
-      if (!projectId || !url) return
-      const absoluteUrl = url.startsWith('/')
-        ? `${typeof window !== 'undefined' ? window.location.origin : ''}${url}`
-        : url
-      const credential = isTauriContext()
-        ? token
-        : typeof window !== 'undefined'
-          ? getWebAuthToken()
-          : null
-      const headers: Array<{ name: string; value: string }> = []
-      if (credential) {
-        headers.push({ name: 'Authorization', value: `Bearer ${credential}` })
-      }
-      const id = canvasMcpServerId(projectId)
-      const list = get().mcpServers
-      const existing = list.find((server) => server.id === id)
-      // Refresh when the URL OR the credential changed: a rotated web-auth
-      // token must replace the stale Authorization header on the persisted
-      // entry (a same-URL early return would leave agent clients sending a
-      // dead bearer token). The header values are compared, never logged.
-      const existingAuthHeader =
-        existing && existing.type === 'http'
-          ? existing.headers?.find((header) => header.name === 'Authorization')?.value
-          : undefined
-      const nextAuthHeader = headers.find((header) => header.name === 'Authorization')?.value
-      if (
-        existing &&
-        existing.type === 'http' &&
-        existing.url === absoluteUrl &&
-        existingAuthHeader === nextAuthHeader
-      ) {
-        // Same URL and same credential posture — nothing to refresh.
-        return
-      }
-      const entry: StoredMcpServer = existing
-        ? {
-            ...existing,
-            type: 'http',
-            name: CANVAS_MCP_SERVER_NAME,
-            url: absoluteUrl,
-            headers: headers.length > 0 ? headers : undefined
-          }
-        : {
-            id,
-            type: 'http',
-            name: CANVAS_MCP_SERVER_NAME,
-            url: absoluteUrl,
-            headers: headers.length > 0 ? headers : undefined,
-            enabled: true
-          }
-      const next = existing
-        ? list.map((server) => (server.id === id ? entry : server))
-        : [...list, entry]
-      set({ mcpServers: next })
-      try {
-        await saveMcpServersToDisk(next, activeProjectId())
-      } catch (err) {
-        set({ mcpServers: list })
-        void logFrontendError({
-          source: 'acp-store.upsertCanvasMcpServer',
-          message: `Failed to persist the canvas MCP entry for project ${projectId} (${String(err)})`
-        })
-        throw err
-      }
+      deletionCounts.set(id, mcpServerDeletionCount(id) + 1)
+      set((s) => ({
+        ...withoutProbeState(s, id),
+        mcpOAuthConnected: omitKey(s.mcpOAuthConnected, id),
+        mcpOAuthConnecting: omitKey(s.mcpOAuthConnecting, id)
+      }))
     }),
 
   // CAP-7: mirror the app-store MCP registry to the named project's
@@ -281,13 +297,12 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
     if (get().mcpProbing[id]) return
     const server = get().mcpServers.find((s) => s.id === id)
     if (!server) return
-    // Strip registry-only fields (`id`/`enabled`) — the probe takes a
-    // stateless `McpServerConfig`, not a registry entry. Mirrors the wire
-    // shape `toWireServer` builds for `session/new` injection.
-    const { id: _id, enabled: _enabled, ...config } = server
+    const deleted = deletionGuard(id)
     set((s) => ({ mcpProbing: { ...s.mcpProbing, [id]: true } }))
     try {
-      const result: ProbeResult = await acpApi.probeMcpServer(config as McpServerConfig)
+      const result: ProbeResult = await acpApi.probeMcpServer(probeConfigOf(server))
+      const stale = settleStaleProbe(set, get, server, deleted)
+      if (stale) return stale
       set((s) => ({
         mcpProbeStatus: { ...s.mcpProbeStatus, [id]: result.status },
         mcpTools: { ...s.mcpTools, [id]: result.tools },
@@ -301,6 +316,12 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
         }
       }))
     } catch (err) {
+      void logFrontendError({
+        source: 'acp-store.probeMcpServer',
+        message: `MCP probe failed for server '${server.name}' (${String(err)})`
+      })
+      const stale = settleStaleProbe(set, get, server, deleted)
+      if (stale) return stale
       // Transport/parse failure (NOT a disconnected probe — that's a
       // `status:'disconnected'` ProbeResult, not a throw). Surface the
       // failure in the dot + log WITHOUT env/header values, tokens, or
@@ -317,16 +338,14 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
         mcpProbing: { ...s.mcpProbing, [id]: false },
         mcpProbeError: { ...s.mcpProbeError, [id]: undefined }
       }))
-      void logFrontendError({
-        source: 'acp-store.probeMcpServer',
-        message: `MCP probe failed for server '${server.name}' (${String(err)})`
-      })
     }
   },
 
   loadMcpTools: async (id) => {
-    // Auto-probe on first expand — no-op if already loaded (or in flight).
-    if (get().mcpToolsLoaded[id] || get().mcpProbing[id]) return
+    if (get().mcpProbing[id]) return
+    const hasReachableProbeResult =
+      get().mcpToolsLoaded[id] && get().mcpProbeStatus[id] !== 'disconnected'
+    if (hasReachableProbeResult) return
     await get().probeMcpServer(id)
   },
   connectMcpOAuth: async (projectId, id) => {
@@ -334,6 +353,7 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
     if (!server) return
     const url = (server as Extract<StoredMcpServer, { type: 'http' | 'sse' }>).url
     if (!url) return
+    const deleted = deletionGuard(id)
     set((s) => ({ mcpOAuthConnecting: { ...s.mcpOAuthConnecting, [id]: true } }))
     void logFrontendError({
       source: 'acp-store.connectMcpOAuth',
@@ -344,6 +364,7 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
       // startMcpOAuth now blocks until the token is stored (desktop: the
       // Tauri command blocks; web: polls the status endpoint). Setting
       // connected state here is correct — the token is confirmed.
+      if (deleted()) return
       set((s) => ({
         mcpOAuthConnected: { ...s.mcpOAuthConnected, [id]: true },
         mcpOAuthConnecting: { ...s.mcpOAuthConnecting, [id]: false }
@@ -353,9 +374,9 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
         message: `OAuth token confirmed for server '${server.name}'`
       })
       // Re-probe now that we have a token — should succeed.
-      await get().probeMcpServer(id)
+      await probeAfterInFlight(get, id)
     } catch (err) {
-      set((s) => ({ mcpOAuthConnecting: { ...s.mcpOAuthConnecting, [id]: false } }))
+      if (!deleted()) set((s) => ({ mcpOAuthConnecting: { ...s.mcpOAuthConnecting, [id]: false } }))
       void logFrontendError({
         source: 'acp-store.connectMcpOAuth',
         message: `OAuth flow failed for server '${server.name}' (${String(err)})`
@@ -369,8 +390,10 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
     if (!server) return
     const url = (server as Extract<StoredMcpServer, { type: 'http' | 'sse' }>).url
     if (!url) return
+    const deleted = deletionGuard(id)
     try {
       const hasToken = await acpApi.hasMcpOAuthToken(projectId, url)
+      if (deleted()) return
       set((s) => ({ mcpOAuthConnected: { ...s.mcpOAuthConnected, [id]: hasToken } }))
     } catch {
       // Best-effort — the probe will still detect authRequired.
@@ -382,15 +405,17 @@ export const createMcpSlice: StateCreator<AcpState, [], [], McpSliceState> = (se
     if (!server) return
     const url = (server as Extract<StoredMcpServer, { type: 'http' | 'sse' }>).url
     if (!url) return
+    const deleted = deletionGuard(id)
     try {
       await acpApi.disconnectMcpOAuth(projectId, url)
+      if (deleted()) return
       set((s) => ({ mcpOAuthConnected: { ...s.mcpOAuthConnected, [id]: false } }))
       void logFrontendError({
         source: 'acp-store.disconnectMcpOAuth',
         message: `OAuth disconnect completed for server '${server.name}'`
       })
       // Re-probe — should return authRequired again.
-      await get().probeMcpServer(id)
+      await probeAfterInFlight(get, id)
     } catch (err) {
       void logFrontendError({
         source: 'acp-store.disconnectMcpOAuth',

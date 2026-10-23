@@ -18,19 +18,19 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+use crate::canvas::bundle_path::{is_bundle_path, redact_canvas_path};
 use crate::web::acp_api;
-use crate::web::auth::WebAuth;
+use crate::web::auth::{BearerVerified, WebAuth};
 
-use crate::acp::{
-    AcpCatalogService, AcpInstallService, AcpManager,
-};
-use crate::canvas::pool::CanvasDaemonPool;
+use crate::acp::{AcpCatalogService, AcpInstallService, AcpManager};
+
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::catalog_api;
 use crate::web::connection_runtime::ConnectionRuntime;
+use crate::web::diagnostics_api;
 use crate::web::fs_api;
 use crate::web::git_api;
 use crate::web::git_diff_stat_api;
@@ -45,6 +45,7 @@ use crate::web::origin::{self, OriginPolicy};
 use crate::web::project_icon_api;
 use crate::web::project_registry::ProjectRegistry;
 use crate::web::projects_api;
+use crate::web::route_deadline;
 use crate::web::search_api;
 use crate::web::sink::WsRelaySink;
 use crate::web::skills_api;
@@ -137,14 +138,9 @@ impl AppState {
 /// route via the [`web_auth_gate`] middleware and stores it in [`AppState`]
 /// for `/ws` + `/terminal/ws`. `None` = ungated (legacy behavior).
 ///
-/// `canvas_pool` backs the `/canvas/*` routes and the ROOT canvas routes
-/// (`/pkg|/canvaskit|/api` — OpenPencil canvas mode, CAP-5/CAP-2): same-origin
-/// embed + MCP proxy + the editor's absolute-path traffic, all proxied to
-/// the managed OpenPencil daemons. `open/close/save` are bearer-gated like
-/// the other API prefixes; the rest carry canvas-credential auth in the
-/// sub-router (see `web::canvas_api`). `None` (the desktop shared-live
-/// host) degrades the routes to typed 502 `DAEMON_DOWN` — the desktop
-/// mounts its MCP proxy on the agentation server instead (AD-8).
+/// The `/canvas/*` routes serve the figcraft bundle same-origin. The API
+/// routes are bearer-gated like the other prefixes; `/canvas/<id>/*` carries
+/// the canvas session token instead (see `web::canvas_api`).
 ///
 /// `connections` is the host's [`ConnectionRuntime`]: the shutdown handle every
 /// upgraded `/ws` + `/terminal/ws` socket joins, and the outbound overflow
@@ -167,12 +163,15 @@ pub fn router(
     shared_live_writes_denied: bool,
     oauth_base_url: String,
     web_auth: Option<Arc<WebAuth>>,
-    canvas_pool: Option<Arc<CanvasDaemonPool>>,
     allowed_origins: OriginPolicy,
     connections: ConnectionRuntime,
 ) -> Router {
     let r = Router::new()
         .route("/health", get(health_check))
+        .route(
+            "/host/agent-idle-window",
+            get(agent_idle_window).post(set_agent_idle_window),
+        )
         .route("/ws", get(ws_upgrade))
         .route("/terminal/ws", get(terminal_ws_upgrade))
         // The host's project registry: the web client reads the non-archived +
@@ -262,7 +261,6 @@ pub fn router(
         .route("/git/stash-drop", post(git_api::stash_drop))
         .route("/git/branch-list", get(git_api::branch_list))
         .route("/git/branch-switch", post(git_api::branch_switch))
-        .route("/git/branch-create", post(git_api::branch_create))
         .route("/git/diff-stat", post(git_diff_stat_api::get_diff_stat))
         // Project icon resolution (spec-project-icon). Mirrors the desktop
         // `project_icon_resolve` command — same shared resolver, read-route
@@ -274,12 +272,19 @@ pub fn router(
         .route("/search/content", post(search_api::content))
         .route("/search/file-names", get(search_api::file_names))
         .route("/search/cancel", post(search_api::cancel))
-        // Skills web routes (CAP-2): `GET /skills` + `GET /skills/:name`.
+        // Skills web routes (CAP-2): `GET /skills`, `GET /skills/:name`, and
+        // `GET /skills-index` (SKILL.md paths for clickable chat chips).
         .route("/skills", get(skills_api::list))
         .route("/skills/{name}", get(skills_api::read))
+        .route("/skills-index", get(skills_api::files))
         // Frontend error forwarding (CAP-2): `POST /log/frontend-error`.
-        // Loopback-only (enforced inside the handler).
-        .route("/log/frontend-error", post(log_api::frontend_error))
+        .route("/log/frontend-error", log_api::route())
+        // Bug-report diagnostics + host-side `gh` submit
+        // (spec-bug-report-dialog). Mirrors the
+        // `collect_bug_report_context` / `submit_bug_report` commands; both
+        // are guarded mutations (`check_local_only` in the handlers).
+        .route("/log/diagnostics", diagnostics_api::diagnostics_route())
+        .route("/log/report-bug", diagnostics_api::report_bug_route())
         .route("/shells", get(fs_api::shells))
         // ACP catalog web routes (CAP-6: Web & Mobile 1:1 Parity). Each
         // mirrors a desktop `#[tauri::command] acp_*_catalog` handler; see
@@ -303,11 +308,7 @@ pub fn router(
         // Worktree web routes (CAP — Web worktree parity). Each mirrors a
         // desktop `#[tauri::command] worktree_*` handler; see
         // `web/worktree_api.rs`. Registered AHEAD of the static fallback so the
-        // SPA mount cannot shadow them. Write routes (`create`/`remove`/
-        // `copy-include-files`/`rename-branch`) are loopback-guarded inside the handler; read
-        // routes (`list`/`branches`/`check-dirty`/`resolve-base-branch`)
-        // enforce containment only. Only the 7 launch-flow routes ship here;
-        // the 8 advanced ops are deferred (see deferred-work.md).
+        // SPA mount cannot shadow them.
         .route("/worktree/list", post(worktree_api::list))
         .route("/worktree/create", post(worktree_api::create))
         .route("/worktree/remove", post(worktree_api::remove))
@@ -324,24 +325,30 @@ pub fn router(
         .route(
             "/worktree/rename-branch",
             post(worktree_rename_api::rename_branch),
+        )
+        .route(
+            "/worktree/parse-gitignore",
+            post(worktree_api::parse_gitignore),
+        )
+        .route(
+            "/worktree/create-symlinks",
+            post(worktree_api::create_symlinks),
+        )
+        .route(
+            "/worktree/ensure-symlinks",
+            post(worktree_api::ensure_symlinks),
         );
     let mut r = r
-        // Canvas web routes (OpenPencil canvas mode, CAP-5): open/close/
-        // save (IpcBody), the stable /canvas/mcp proxy, the same-origin
-        // /canvas/<id>/* embed proxy, and the ROOT canvas routes
-        // (/pkg|/canvaskit|/api — the editor's absolute-path traffic).
-        // Merged BEFORE the static fallback so the SPA mount cannot shadow
-        // them. Bearer-gated via GATED_PREFIXES ("/canvas/") for
-        // open/close/save only: /canvas/mcp, /canvas/<id>/*, and the root
-        // routes are exempt from the bearer gate (is_canvas_proxy_path /
-        // not under a gated prefix) and authenticated by the canvas
-        // sub-router's own credentials instead (browser iframes cannot
-        // send Authorization headers). The boundary validates web-opened
-        // doc paths against the same project registry the fs/git routes use.
+        // Canvas web routes: open/close/persistence (IpcBody) and the
+        // same-origin /canvas/<id>/* bundle. Merged BEFORE the static fallback
+        // so the SPA mount cannot shadow them. The API routes are bearer-gated
+        // via GATED_PREFIXES ("/canvas/"); /canvas/<id>/* is exempt
+        // (is_bundle_path) and authenticated by the canvas session token
+        // instead (browser iframes cannot send Authorization headers). The
+        // boundary validates web-opened doc paths against the same project
+        // registry the fs/git routes use.
         .merge(crate::web::canvas_api::canvas_router(
             crate::web::canvas_api::CanvasState {
-                pool: canvas_pool,
-                web_auth: web_auth.clone(),
                 boundary: Some(crate::web::canvas_api::CanvasProjectBoundary {
                     registry: registry.clone(),
                 }),
@@ -364,6 +371,7 @@ pub fn router(
     // layer marks them `no-cache, must-revalidate`; on the embedded path it
     // writes the same value the embed already sets (idempotent).
     r = r.layer(middleware::from_fn(assets::shell_no_cache_headers));
+    r = r.layer(middleware::from_fn(route_deadline::bound));
     // #857: gzip responses when `Accept-Encoding` allows (cold load 3.66 MB →
     // ~1 MB) + pin Vite-hashed `/assets/*` immutable for a year on the disk
     // `ServeDir` path (the embedded path already sets the same value in
@@ -425,6 +433,7 @@ const PUBLIC_PATHS: &[&str] = &["/health", "/ws", "/terminal/ws", "/oauth/callba
 /// (CAP-1 intent: "every endpoint"). Everything else — the static bundle and
 /// SPA client routes — stays public so the login page can load.
 const GATED_PREFIXES: &[&str] = &[
+    "/host/",
     "/projects",
     "/project/",
     "/mcp-servers",
@@ -436,38 +445,21 @@ const GATED_PREFIXES: &[&str] = &[
     "/shells",
     "/acp/",
     "/worktree/",
-    // OpenPencil canvas mode: the /canvas/open|close|save API routes
-    // require the token. /canvas/mcp and the /canvas/<id>/* embed paths are
-    // exempt — see [`is_canvas_proxy_path`] (canvas-credential authed in
-    // the sub-router); the root canvas routes (/pkg, /canvaskit, /api) are
-    // not under any gated prefix (cookie authed in the sub-router).
+    // The /canvas/ API routes require the token. The /canvas/<id>/* bundle
+    // paths are exempt — see [`is_bundle_path`] (canvas-token authed
+    // in the sub-router).
     "/canvas/",
 ];
 
-/// Whether `path` is canvas-credential authed INSTEAD of the outer bearer
-/// gate: `/canvas/mcp` (accepts the web auth bearer OR the canvas cookie —
-/// canvas layer) and the `/canvas/<id>…` embed/proxy paths (`?ct=` canvas
-/// token, first segment after `/canvas/` is a canvas id, not an API route
-/// name). The root canvas routes (`/pkg|/canvaskit|/api`) need no exemption
-/// — they are not under any gated prefix; their cookie middleware owns them.
-fn is_canvas_proxy_path(path: &str) -> bool {
-    if path == "/canvas/mcp" {
-        return true;
-    }
-    path.strip_prefix("/canvas/").is_some_and(|rest| {
-        !matches!(rest.split('/').next(), Some("open" | "close" | "save"))
-    })
-}
 
 /// Whether `path` is a gated API route. Pure decision fn (unit-testable).
 fn requires_token(path: &str) -> bool {
     if PUBLIC_PATHS.contains(&path) {
         return false;
     }
-    // Canvas embed/proxy paths and /canvas/mcp carry their own canvas
-    // credentials (ct token / cookie / canvas-layer bearer check); the
+    // Canvas bundle paths carry their own canvas token in the path; the
     // outer bearer gate skips them.
-    if is_canvas_proxy_path(path) {
+    if is_bundle_path(path) {
         return false;
     }
     GATED_PREFIXES.iter().any(|prefix| path.starts_with(prefix))
@@ -495,17 +487,24 @@ fn presented_token(request: &Request) -> Option<String> {
 /// Axum middleware enforcing the web auth gate on gated API routes. The 401
 /// body mirrors the `IpcBody` failure shape (`{success, error, code}`) the
 /// renderer's REST helpers parse; the token is never logged or echoed.
-async fn web_auth_gate(State(auth): State<Arc<WebAuth>>, request: Request, next: Next) -> Response {
+async fn web_auth_gate(
+    State(auth): State<Arc<WebAuth>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     if !requires_token(request.uri().path()) {
         return next.run(request).await;
     }
     let presented = presented_token(&request);
     match presented {
-        Some(token) if auth.accepts(&token) => next.run(request).await,
+        Some(token) if auth.accepts(&token) => {
+            request.extensions_mut().insert(BearerVerified);
+            next.run(request).await
+        }
         _ => {
             tracing::warn!(
                 target: "termul::web::router",
-                path = request.uri().path(),
+                path = %redact_canvas_path(request.uri().path()),
                 "web auth gate refused API request"
             );
             (
@@ -536,6 +535,10 @@ pub fn router_with_static(
 ) -> Router {
     let r = Router::new()
         .route("/health", get(health_check))
+        .route(
+            "/host/agent-idle-window",
+            get(agent_idle_window).post(set_agent_idle_window),
+        )
         .route("/ws", get(ws_upgrade))
         .route("/terminal/ws", get(terminal_ws_upgrade))
         .route("/projects", get(projects_api::list))
@@ -583,7 +586,6 @@ pub fn router_with_static(
         .route("/git/stash-drop", post(git_api::stash_drop))
         .route("/git/branch-list", get(git_api::branch_list))
         .route("/git/branch-switch", post(git_api::branch_switch))
-        .route("/git/branch-create", post(git_api::branch_create))
         .route("/git/diff-stat", post(git_diff_stat_api::get_diff_stat))
         .route("/project/icon", post(project_icon_api::resolve_icon))
         .route("/search/rg-info", get(search_api::rg_info))
@@ -592,7 +594,10 @@ pub fn router_with_static(
         .route("/search/cancel", post(search_api::cancel))
         .route("/skills", get(skills_api::list))
         .route("/skills/{name}", get(skills_api::read))
-        .route("/log/frontend-error", post(log_api::frontend_error))
+        .route("/skills-index", get(skills_api::files))
+        .route("/log/frontend-error", log_api::route())
+        .route("/log/diagnostics", diagnostics_api::diagnostics_route())
+        .route("/log/report-bug", diagnostics_api::report_bug_route())
         .route("/shells", get(fs_api::shells))
         .route("/acp/catalog", get(catalog_api::list))
         .route("/acp/catalog/opt-in", post(catalog_api::set_opt_in))
@@ -618,15 +623,11 @@ pub fn router_with_static(
             "/acp/factory-key",
             get(acp_api::factory_key_status).post(acp_api::factory_key_save),
         );
-    // Canvas routes parity (test/dev variant): the pool is always `None`
-    // here — the routes degrade to typed 502 DAEMON_DOWN, which is exactly
-    // what the auth tests assert. The boundary is still wired so open's
-    // doc-path validation behavior matches production.
+    // Canvas routes parity (test/dev variant): the boundary is wired so
+    // open's doc-path validation behavior matches production.
     let r = r
         .merge(crate::web::canvas_api::canvas_router(
             crate::web::canvas_api::CanvasState {
-                pool: None,
-                web_auth: web_auth.clone(),
                 boundary: Some(crate::web::canvas_api::CanvasProjectBoundary {
                     registry: registry.clone(),
                 }),
@@ -640,6 +641,7 @@ pub fn router_with_static(
     // PWA parity with `router`: mark the unversioned shell/PWA files no-cache
     // so the disk-served bundle doesn't stall SW updates (same layer).
     let r = r.layer(middleware::from_fn(assets::shell_no_cache_headers));
+    let r = r.layer(middleware::from_fn(route_deadline::bound));
     // #857 parity with `router`: gzip + immutable hashed-asset caching on the
     // disk-served static bundle.
     let r = r
@@ -707,9 +709,14 @@ async fn health_check(
         Json(HealthBody {
             status: "ok",
             allow_remote_writes: allow,
+            case_insensitive_paths: PATHS_CASE_INSENSITIVE_BY_TARGET,
         }),
     )
 }
+
+/// The source of truth for the web client's path case rule (#641). A per-volume
+/// probe would need a path, and `/health` is host-wide.
+const PATHS_CASE_INSENSITIVE_BY_TARGET: bool = cfg!(any(windows, target_os = "macos"));
 
 /// `GET /health` response body.
 #[derive(Serialize)]
@@ -717,6 +724,93 @@ async fn health_check(
 struct HealthBody {
     status: &'static str,
     allow_remote_writes: bool,
+    case_insensitive_paths: bool,
+}
+
+/// `GET /host/agent-idle-window` — the live idle-chat window. Same `IpcResult`
+/// envelope as the other host reads so the web client can parse it with
+/// `getJson`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentIdleWindowBody {
+    success: bool,
+    data: crate::web::agent_reaper::AgentIdleWindowStatus,
+}
+
+async fn agent_idle_window() -> impl IntoResponse {
+    let data = crate::web::agent_reaper::resolved_agent_idle_window();
+    tracing::debug!(
+        target: "termul::web::agent_reaper",
+        secs = data.secs,
+        source = data.source,
+        "agent idle window probe"
+    );
+    (StatusCode::OK, Json(idle_window_ok(data)))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetAgentIdleWindowRequest {
+    secs: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentIdleWindowError {
+    success: bool,
+    error: String,
+    code: String,
+}
+
+fn idle_window_ok(data: crate::web::agent_reaper::AgentIdleWindowStatus) -> AgentIdleWindowBody {
+    AgentIdleWindowBody {
+        success: true,
+        data,
+    }
+}
+
+/// `POST /host/agent-idle-window` — save the Settings choice. A flag or
+/// `$TERMUL_AGENT_IDLE_REAP_SECS` keeps the live window. View-only peers
+/// (shared-live, or a remote peer without `--allow-remote-writes`) are refused.
+async fn set_agent_idle_window(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(body): Json<SetAgentIdleWindowRequest>,
+) -> Response {
+    let allowed = crate::web::capabilities::write_decision(
+        peer,
+        crate::web::capabilities::WriteFlags::from_state(&state),
+    )
+    .is_allowed();
+    if !allowed {
+        tracing::info!(
+            target: "termul::web::agent_reaper",
+            "agent idle window change refused for a view-only peer"
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(AgentIdleWindowError {
+                success: false,
+                error: "this connection cannot change host settings".to_string(),
+                code: "FORBIDDEN".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    if matches!(body.secs, Some(0)) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AgentIdleWindowError {
+                success: false,
+                error: "agent idle window must be greater than 0 seconds".to_string(),
+                code: "INVALID_IDLE_WINDOW".to_string(),
+            }),
+        )
+            .into_response();
+    }
+    crate::web::agent_reaper::set_agent_idle_window_override(body.secs);
+    let data = crate::web::agent_reaper::resolved_agent_idle_window();
+    (StatusCode::OK, Json(idle_window_ok(data))).into_response()
 }
 
 #[cfg(test)]

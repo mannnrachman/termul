@@ -32,7 +32,10 @@ pub(super) async fn run_command_loop(
     let init_request = InitializeRequest::new(ProtocolVersion::V1)
         .client_capabilities(client::client_capabilities(allow_terminal))
         .client_info(Implementation::new("termul", env!("CARGO_PKG_VERSION")).title("Termul"));
-    let init_message = match initialize_message(&init_request) {
+    if profile.native_subagents {
+        log::info!("[acp] agent {agent_id}: advertising native subagent sessions");
+    }
+    let init_message = match initialize_message(&init_request, profile.native_subagents) {
         Ok(message) => message,
         Err(error) => {
             let _ = init_tx.send(Err(error.clone()));
@@ -95,6 +98,17 @@ pub(super) async fn run_command_loop(
             let _ = init_tx.send(Err(message.clone()));
             return Err(agent_client_protocol::Error::internal_error().data(message));
         }
+    };
+
+    // Issue #784: let a pending `ask_user` keep this agent's turns from timing
+    // out on idle while the user answers. Forgotten when the loop ends.
+    host_plan_server.set_idle_signal(&agent_id.0, {
+        let state = driver_state.clone();
+        Arc::new(move |session_id: &str| state.lock().signal_idle(session_id))
+    });
+    let _idle_signal = IdleSignalGuard {
+        server: host_plan_server.clone(),
+        agent_id: agent_id.0.clone(),
     };
 
     // Step 2: command loop.
@@ -280,6 +294,7 @@ pub(super) async fn run_command_loop(
                 session_id,
                 cwd,
                 additional_directories,
+                mcp_servers,
                 reply,
             } => {
                 let slot = reply_slot(reply);
@@ -365,6 +380,9 @@ pub(super) async fn run_command_loop(
                     // held indefinitely).
                     let mut request = LoadSessionRequest::new(&session_id, cwd.clone())
                         .additional_directories(additional_directories);
+                    if let Some(mcp_servers) = mcp_servers {
+                        request = request.mcp_servers(mcp_servers);
+                    }
                     if profile.summarize_thinking {
                         request = request.meta(summarized_thinking_meta());
                     }
@@ -389,6 +407,7 @@ pub(super) async fn run_command_loop(
                 session_id,
                 cwd,
                 additional_directories,
+                mcp_servers,
                 reply,
             } => {
                 let slot = reply_slot(reply);
@@ -452,6 +471,9 @@ pub(super) async fn run_command_loop(
                     };
                     let mut request = ResumeSessionRequest::new(&session_id, cwd.clone())
                         .additional_directories(additional_directories);
+                    if let Some(mcp_servers) = mcp_servers {
+                        request = request.mcp_servers(mcp_servers);
+                    }
                     if profile.summarize_thinking {
                         request = request.meta(summarized_thinking_meta());
                     }
@@ -477,6 +499,7 @@ pub(super) async fn run_command_loop(
                 // and wait for its terminator before `session/close`, so the
                 // turn ends with exactly one `prompt_complete` and the close
                 // never races the turn task's own cleanup.
+                host_plan_server.cancel_asks_for_session(&session_id.0);
                 let (waiter, pending, pending_questions, pending_elicitations) = {
                     let mut state = driver_state.lock();
                     state.signal_cancel(&session_id.0);
@@ -663,8 +686,8 @@ pub(super) async fn run_command_loop(
                     // hard wall-clock cap. Both default to `None` (unlimited):
                     // a turn is bounded only if the operator/user configured a
                     // value. On idle/hard timeout → signal cancel +
-                    // `CANCEL_GRACE` + a typed error (`acp-store` sets
-                    // `status: 'error'`). See [`race_turn`].
+                    // `CANCEL_GRACE` + a typed error (an `agent_error` and a
+                    // `timeout` terminator). See [`race_turn`].
                     let idle = turn_idle_timeout();
                     let hard = resolved_turn_timeout();
                     let cancel_state = turn_state.clone();
@@ -719,6 +742,9 @@ pub(super) async fn run_command_loop(
                     // driver active-turn marker, then resolve permissions that
                     // were never answered (H3 — normal completion, not just cancel).
                     turn_plan_server.end_turn(&turn_agent_id.0, &session_id.0);
+                    // Issue #784: an `ask_user` call still open when the turn ends
+                    // resolves as cancelled, like the `_session/question` path below.
+                    turn_plan_server.cancel_asks_for_session(&session_id.0);
                     let pending = turn_state.lock().finish_turn(&session_id.0);
                     for permission in pending {
                         let _ = permission.responder.respond(RequestPermissionResponse::new(
@@ -820,6 +846,7 @@ pub(super) async fn run_command_loop(
                             &turn_session,
                             spawn_turn_id,
                             events::TurnFailureStop::Error.into(),
+                            None,
                         );
                     }
                     let _ = accepted.send(Err(error.clone()));
@@ -1048,6 +1075,7 @@ pub(super) async fn run_command_loop(
                     state.signal_cancel(&session_id.0);
                     state.drain_session(&session_id.0)
                 };
+                host_plan_server.cancel_asks_for_session(&session_id.0);
                 for permission in pending {
                     let _ = permission.responder.respond(RequestPermissionResponse::new(
                         RequestPermissionOutcome::Cancelled,
@@ -1281,7 +1309,13 @@ pub(super) async fn run_command_loop(
                         let _ = reply.send(result.map_err(|e| e.to_string()));
                     }
                     None => {
-                        let _ = reply.send(Err(format!("unknown question request: {question_id}")));
+                        // Issue #784: an `ask_user` call parked by the host MCP server.
+                        if host_plan_server.answer_ask(&question_id, values) {
+                            let _ = reply.send(Ok(()));
+                        } else {
+                            let _ =
+                                reply.send(Err(format!("unknown question request: {question_id}")));
+                        }
                     }
                 }
             }
@@ -1393,6 +1427,18 @@ pub(super) async fn run_command_loop(
     Ok(())
 }
 
+/// Clears the agent's `ask_user` idle signal however the command loop ends.
+struct IdleSignalGuard {
+    server: Arc<crate::acp::host_mcp::parent::HostPlanServer>,
+    agent_id: String,
+}
+
+impl Drop for IdleSignalGuard {
+    fn drop(&mut self) {
+        self.server.clear_idle_signal(&self.agent_id);
+    }
+}
+
 /// Spawn an agent→client request task on the connection, keeping the command
 /// loop free to service other commands (notably `RespondPermission`) while it
 /// runs (the C1 fix).
@@ -1435,10 +1481,16 @@ pub(super) fn send_reply<T>(slot: &ReplySlot<T>, value: Result<T, String>) {
     }
 }
 
-/// Typed initialize plus the Codex gateway auth capability, which SDK 1.3
-/// cannot set on `AuthCapabilities`.
-fn initialize_message(request: &InitializeRequest) -> Result<UntypedMessage, String> {
+/// Typed initialize plus the capabilities SDK 1.3 cannot set: Codex gateway
+/// auth, and (Claude only) native subagent sessions.
+pub(super) fn initialize_message(
+    request: &InitializeRequest,
+    native_subagents: bool,
+) -> Result<UntypedMessage, String> {
     let mut value = serde_json::to_value(request).map_err(|error| error.to_string())?;
+    if native_subagents {
+        super::native_subagents::advertise_subagents(&mut value);
+    }
     if let Some(auth) = value
         .get_mut("clientCapabilities")
         .and_then(|caps| caps.get_mut("auth"))

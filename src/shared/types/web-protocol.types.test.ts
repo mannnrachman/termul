@@ -88,8 +88,8 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
     expect(WS_REQUEST_TYPES).toContain('get_session_payload')
   })
 
-  it('exports exactly 50 request types including warm-pool promotion and host-owned session delete', () => {
-    expect(WS_REQUEST_TYPES).toHaveLength(50)
+  it('exports exactly 55 request types including warm-pool promotion and host-owned session delete', () => {
+    expect(WS_REQUEST_TYPES).toHaveLength(55)
     const expected = [
       'send_prompt',
       'cancel_prompt',
@@ -128,6 +128,7 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'respond_elicitation',
       'list_acp_catalog',
       'set_catalog_opt_in',
+      'fetch_acp_registry_snapshot',
       // CAP-6 / Story 9: host-owned verified-atomic ACP install.
       'install_acp_agent',
       // Issue #613: server-side generic key-value store.
@@ -144,6 +145,8 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'acp_deliver_auth_redirect',
       // CAP-2 (spec-in-chat-agent-switch): host-authored durable marker.
       'record_agent_switch',
+      // A surface read a chat: move the shared last-read marker.
+      'mark_chat_read',
       // Watches (projects, chat history, agents, fs, store, terminals).
       'watch',
       'unwatch',
@@ -153,7 +156,11 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'list_claude_accounts',
       'list_claude_usage',
       'set_default_claude_account',
-      'set_project_claude_account'
+      'set_project_claude_account',
+      // The canvas gateway's renderer leg.
+      'canvas_mount',
+      'canvas_unmount',
+      'canvas_reply'
     ]
     for (const name of expected) {
       expect(WS_REQUEST_TYPES).toContain(name)
@@ -173,9 +180,9 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
 })
 
 describe('web-protocol.types — error codes (AC2)', () => {
-  it('exports exactly 26 stable error codes', () => {
+  it('exports exactly 27 stable error codes', () => {
     const codes = new Set(Object.values(WS_ERROR_CODES))
-    expect(codes.size).toBe(26)
+    expect(codes.size).toBe(27)
     const expected = [
       'not_found',
       'unauthorized',
@@ -207,7 +214,9 @@ describe('web-protocol.types — error codes (AC2)', () => {
       'invalid_agent_config',
       // Command ledger refusals.
       'command_conflict',
-      'invalid_command_id'
+      'invalid_command_id',
+      // A Claude Account that is not signed in.
+      'claude_account_signed_out'
     ]
     for (const code of expected) {
       expect(codes).toContain(code)

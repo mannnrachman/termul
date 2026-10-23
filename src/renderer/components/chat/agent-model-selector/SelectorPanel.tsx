@@ -10,7 +10,7 @@ import {
 } from 'react'
 import { MoreHorizontal, Search } from '@/components/icons'
 import { INNER_FIELD_FOCUS_CLASS } from '@/components/ui/panel-styles'
-import type { SessionConfigOption, SessionUsage } from '@/lib/acp-api'
+import type { AgentCapabilities, SessionConfigOption, SessionUsage } from '@/lib/acp-api'
 import type { SupportedAcpAgentEntry } from '@/lib/agents/supported-acp-agents'
 import { cn } from '@/lib/utils'
 import { shouldShowSessionUsage } from '../context-usage-utils'
@@ -32,6 +32,7 @@ import {
   armableConfigId,
   buildAgentTabs,
   type CatalogModel,
+  capabilitySummary,
   catalogModels,
   entryDisableReason,
   MORE_AGENTS_VIEW,
@@ -76,10 +77,14 @@ export interface SelectorPanelProps {
   fastOn: boolean
   onToggleFast: (() => void) | null
   genericOptions: SessionConfigOption[]
+  /** The effective agent's config id; keys persisted option-value rejections. */
+  agentConfigId: string | null
   onSetConfig: (configId: string, valueId: string | boolean) => void | Promise<void>
   /** Session context usage for the summary row (chat only; launcher omits it). */
   usage?: SessionUsage | null
   messages?: ReadonlyArray<{ role: string }>
+  /** What the chat's agent advertised (chat only; the launcher omits it). */
+  capabilities?: AgentCapabilities | null
   onClose: () => void
   /** Set by the panel: clears its inner state on Escape; true when it did. */
   escapeRef: MutableRefObject<(() => boolean) | null>
@@ -211,6 +216,8 @@ export function SelectorPanel(props: SelectorPanelProps): React.JSX.Element {
     setView(tab.configId)
   }
 
+  // Capabilities belong to the chat's agent, so only its rows carry them.
+  const capabilities = capabilitySummary(props.capabilities)
   const rows = (
     configId: string | null,
     catalog: ModelCatalog | null,
@@ -223,7 +230,11 @@ export function SelectorPanel(props: SelectorPanelProps): React.JSX.Element {
       <ModelRow
         key={`${configId}\0${model.value}`}
         name={model.name}
-        description={model.description}
+        tooltip={
+          [model.description, configId === sw.currentConfigId ? capabilities : null]
+            .filter(Boolean)
+            .join('\n\n') || undefined
+        }
         selected={model.value === selectedValue}
         glyph={showAgent && tab ? <TabGlyph tab={tab} /> : undefined}
         meta={showAgent && configId !== effectiveId ? tab?.name : undefined}
@@ -336,7 +347,12 @@ export function SelectorPanel(props: SelectorPanelProps): React.JSX.Element {
         />
       )
     } else {
-      body = <ListMessage title="This agent gives no model choice." />
+      body = (
+        <ListMessage
+          title="This agent gives no model choice."
+          detail={effectiveId === sw.currentConfigId ? (capabilities ?? undefined) : undefined}
+        />
+      )
     }
   } else if (viewKind === 'current') {
     body = (
@@ -344,7 +360,10 @@ export function SelectorPanel(props: SelectorPanelProps): React.JSX.Element {
         {liveCatalog ? (
           rows(viewId, liveCatalog, liveCatalog.options, undefined, viewTab, false)
         ) : (
-          <ListMessage title={`${nameOf(viewId)} gives no model choice.`} />
+          <ListMessage
+            title={`${nameOf(viewId)} gives no model choice.`}
+            detail={capabilities ?? undefined}
+          />
         )}
         <Hint>{`Keeps ${nameOf(viewId)} and cancels the switch to ${nameOf(sw.armedConfigId)}.`}</Hint>
       </>
@@ -490,6 +509,7 @@ export function SelectorPanel(props: SelectorPanelProps): React.JSX.Element {
       onSetConfig={props.onSetConfig}
       disabled={disabled}
       touch={touch}
+      agentConfigId={effectiveId}
     />
   )
   // The footer controls the composer's agent only. Another agent's tab shows
@@ -504,7 +524,10 @@ export function SelectorPanel(props: SelectorPanelProps): React.JSX.Element {
       : null
 
   return (
-    <div data-testid="agent-model-selector-panel" className={cn('flex flex-col', !touch && 'w-80')}>
+    <div
+      data-testid="agent-model-selector-panel"
+      className={cn('flex min-h-0 flex-col', !touch && 'w-80')}
+    >
       <div className={cn('peer flex items-center gap-2', touch ? 'h-12 px-5' : 'h-10 px-3')}>
         <Search
           size={touch ? 16 : 14}

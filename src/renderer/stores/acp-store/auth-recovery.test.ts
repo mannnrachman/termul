@@ -99,7 +99,9 @@ vi.mock('@/stores/workspace-store', () => {
     getAllLeafPanes,
     findPaneContainingTab,
     agentChatTabId: (sessionId: string) => `chat-${sessionId}`,
+    getAgentChatSessionIdsInAllTrees: () => new Set<string>(),
     useWorkspaceStore: {
+      subscribe: () => () => {},
       getState: () => ({
         addAgentChatTab: addAgentChatTabSpy,
         removeTab: workspaceStateRef.current.removeTab,
@@ -157,7 +159,14 @@ import {
   useAcpStore
 } from '@/stores/acp-store'
 import { useProjectStore } from '@/stores/project-store'
-import { FRESH } from './testkit'
+import {
+  FRESH,
+  makeConfigOption,
+  makeMode,
+  makeModel,
+  seedOptionsSession,
+  seedSession
+} from './testkit'
 
 describe('acp provider authentication & recovery', () => {
   beforeEach(() => {
@@ -1185,6 +1194,119 @@ describe('acp provider authentication & recovery', () => {
     }
   })
 
+  it('authorizes auto-open only for a capture that arrives while a sign-in is in flight', async () => {
+    const listeners = new Map<string, (payload: unknown) => void>()
+    let finishAuth: () => void = () => {}
+    const authenticate = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishAuth = resolve
+        })
+    )
+    _setAcpTransportForTests({
+      onEvent: vi.fn((name: string, callback: (payload: unknown) => void) => {
+        listeners.set(name, callback)
+        return () => listeners.delete(name)
+      }),
+      authenticate,
+      dispose: vi.fn()
+    } as unknown as AcpTransport)
+    const teardown = initAcpEventListeners()
+    try {
+      seedLiveAgent('agent-1', [{ id: 'devin-browser', name: 'Browser sign-in', type: 'agent' }])
+      const capture = (url: string) =>
+        listeners.get('acp:browser_open_request')?.({ agentId: 'agent-1', url })
+
+      capture('https://evil.example.com/')
+      expect(useAcpStore.getState().pendingBrowserOpen['agent-1']).toBe('https://evil.example.com/')
+      expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBeUndefined()
+
+      const signIn = useAcpStore.getState().authenticateAgent('agent-1', 'devin-browser')
+      capture('https://auth.example.com/login?state=abc')
+      expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBe(
+        'https://auth.example.com/login?state=abc'
+      )
+
+      finishAuth()
+      await signIn
+      expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBeUndefined()
+
+      capture('https://evil.example.com/after')
+      expect(useAcpStore.getState().pendingBrowserOpen['agent-1']).toBe(
+        'https://evil.example.com/after'
+      )
+      expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBeUndefined()
+    } finally {
+      teardown()
+      _resetAcpTransportForTests()
+    }
+  })
+
+  it('authorizes only the first capture of a sign-in flight and revokes on a different later one', async () => {
+    const listeners = new Map<string, (payload: unknown) => void>()
+    const finishers: Array<() => void> = []
+    const authenticate = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishers.push(resolve)
+        })
+    )
+    _setAcpTransportForTests({
+      onEvent: vi.fn((name: string, callback: (payload: unknown) => void) => {
+        listeners.set(name, callback)
+        return () => listeners.delete(name)
+      }),
+      authenticate,
+      dispose: vi.fn()
+    } as unknown as AcpTransport)
+    const teardown = initAcpEventListeners()
+    try {
+      seedLiveAgent('agent-1', [{ id: 'devin-browser', name: 'Browser sign-in', type: 'agent' }])
+      const capture = (url: string) =>
+        listeners.get('acp:browser_open_request')?.({ agentId: 'agent-1', url })
+
+      const firstFlight = useAcpStore.getState().authenticateAgent('agent-1', 'devin-browser')
+      capture('https://auth.example.com/first')
+      expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBe(
+        'https://auth.example.com/first'
+      )
+
+      capture('https://evil.example.com/second')
+      expect(useAcpStore.getState().pendingBrowserOpen['agent-1']).toBe(
+        'https://evil.example.com/second'
+      )
+      expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBeUndefined()
+
+      capture('https://evil.example.com/third')
+      expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBeUndefined()
+
+      finishers[0]()
+      await firstFlight
+
+      const secondFlight = useAcpStore.getState().authenticateAgent('agent-1', 'devin-browser')
+      capture('https://auth.example.com/retry')
+      expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBe(
+        'https://auth.example.com/retry'
+      )
+      finishers[1]()
+      await secondFlight
+    } finally {
+      teardown()
+      _resetAcpTransportForTests()
+    }
+  })
+
+  it('revokes the auto-open authorization when a later capture is not part of a sign-in', () => {
+    seedLiveAgent('agent-1', [])
+    useAcpStore.setState((s) => ({
+      pendingBrowserOpen: { ...s.pendingBrowserOpen, 'agent-1': 'https://auth.x/ok' },
+      autoOpenBrowserUrl: { ...s.autoOpenBrowserUrl, 'agent-1': 'https://auth.x/ok' }
+    }))
+    useAcpStore.getState()._onBrowserOpenRequest({ agentId: 'agent-1', url: 'https://evil.x/' })
+    expect(useAcpStore.getState().pendingBrowserOpen['agent-1']).toBe('https://evil.x/')
+    expect(useAcpStore.getState().autoOpenBrowserUrl['agent-1']).toBeUndefined()
+  })
+
   it('clears pendingBrowserOpen on killAgent and on agent disconnect', async () => {
     seedLiveAgent('agent-1', [])
     useAcpStore.setState((s) => ({
@@ -1260,6 +1382,7 @@ describe('acp provider authentication & recovery', () => {
       .getState()
       ._onAgentSpawned({ agentId: 'agent-early', capabilities: {}, authMethods: [] })
     expect(useAcpStore.getState().pendingBrowserOpen['agent-early']).toBe('https://auth.x/early')
+    expect(useAcpStore.getState().autoOpenBrowserUrl['agent-early']).toBeUndefined()
     // Teardown clears a still-buffered request too.
     useAcpStore
       .getState()
@@ -2183,5 +2306,218 @@ describe('acp provider authentication & recovery', () => {
     expect(lastError).toContain('choose a sign-in method')
     expect(lastError).not.toContain('pick one of the methods below')
     expect(vi.mocked(invoke).mock.calls.filter(([c]) => c === 'acp_authenticate')).toHaveLength(0)
+  })
+
+  describe('auth-gated calls after a mid-session token expiry', () => {
+    function emitPromptAuthError(): void {
+      useAcpStore.getState()._onAgentError({
+        agentId: 'agent-1',
+        sessionId: 's1',
+        message: 'Authentication required',
+        code: -32000
+      })
+    }
+
+    it('re-authenticates after a prompt reports auth-required and offers Retry without resending', async () => {
+      seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Sign in with Cursor' }])
+      seedSession('s1', 'agent-1', false)
+      vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === 'acp_authenticate') return undefined
+        if (cmd === 'acp_send_prompt') {
+          emitPromptAuthError()
+          throw authRequiredError()
+        }
+        throw new Error(`unexpected invoke command: ${cmd}`)
+      })
+
+      await expect(useAcpStore.getState().sendPrompt('s1', 'hello')).rejects.toThrow(
+        'not authenticated'
+      )
+
+      expect(vi.mocked(invoke).mock.calls.map(([cmd]) => cmd)).toEqual([
+        'acp_send_prompt',
+        'acp_authenticate'
+      ])
+      const state = useAcpStore.getState()
+      expect(state.agentStatus['agent-1']).toBe('connected')
+      expect(state.sessions.s1).toMatchObject({
+        status: 'active',
+        activeTurn: false,
+        openTurnId: null,
+        lastError: 'Signed in to the agent again. Select Retry to send your message.'
+      })
+    })
+
+    it('offers Retry when the agent_error event arrives after the prompt error reply', async () => {
+      seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Sign in with Cursor' }])
+      seedSession('s1', 'agent-1', false)
+      vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === 'acp_authenticate') {
+          emitPromptAuthError()
+          return undefined
+        }
+        if (cmd === 'acp_send_prompt') throw authRequiredError()
+        throw new Error(`unexpected invoke command: ${cmd}`)
+      })
+
+      await expect(useAcpStore.getState().sendPrompt('s1', 'hello')).rejects.toThrow(
+        'not authenticated'
+      )
+
+      const state = useAcpStore.getState()
+      expect(state.agentStatus['agent-1']).toBe('connected')
+      expect(state.sessions.s1).toMatchObject({
+        status: 'active',
+        activeTurn: false,
+        lastError: 'Signed in to the agent again. Select Retry to send your message.'
+      })
+    })
+
+    it('drops the sign-in result of a failed prompt once a newer prompt has finished', async () => {
+      seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Sign in with Cursor' }])
+      seedSession('s1', 'agent-1', false)
+      let finishSignIn: () => void = () => {}
+      let sends = 0
+      vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === 'acp_authenticate') {
+          return new Promise<undefined>((resolve) => {
+            finishSignIn = () => resolve(undefined)
+          })
+        }
+        if (cmd === 'acp_send_prompt') {
+          sends += 1
+          if (sends === 1) throw authRequiredError()
+          useAcpStore.getState()._onPromptComplete({
+            agentId: 'agent-1',
+            sessionId: 's1',
+            stopReason: 'end_turn'
+          })
+          return 'end_turn'
+        }
+        throw new Error(`unexpected invoke command: ${cmd}`)
+      })
+
+      const first = useAcpStore.getState().sendPrompt('s1', 'hello')
+      await vi.waitFor(() =>
+        expect(vi.mocked(invoke).mock.calls.map(([cmd]) => cmd)).toContain('acp_authenticate')
+      )
+      await useAcpStore.getState().sendPrompt('s1', 'second')
+      await vi.waitFor(() => expect(useAcpStore.getState().sessions.s1?.activeTurn).toBe(false))
+      finishSignIn()
+      await expect(first).rejects.toThrow('not authenticated')
+
+      expect(useAcpStore.getState().sessions.s1).toMatchObject({
+        status: 'active',
+        activeTurn: false,
+        lastError: null
+      })
+    })
+
+    it('points a multi-method prompt auth failure at the launcher picker', async () => {
+      seedLiveAgent('agent-1', [
+        { id: 'chatgpt', name: 'ChatGPT' },
+        { id: 'api_key', name: 'API Key' }
+      ])
+      seedSession('s1', 'agent-1', false)
+      vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === 'acp_send_prompt') {
+          emitPromptAuthError()
+          throw authRequiredError()
+        }
+        throw new Error(`unexpected invoke command: ${cmd}`)
+      })
+
+      await expect(useAcpStore.getState().sendPrompt('s1', 'hello')).rejects.toThrow(
+        'not authenticated'
+      )
+
+      expect(vi.mocked(invoke).mock.calls.map(([cmd]) => cmd)).toEqual(['acp_send_prompt'])
+      expect(useAcpStore.getState().sessions.s1?.lastError).toBe(
+        'This agent requires sign-in. Start a new chat for this agent to choose a sign-in method, then retry.'
+      )
+    })
+
+    it.each([
+      {
+        name: 'setMode',
+        command: 'acp_set_mode',
+        run: () => useAcpStore.getState().setMode('s1', 'code'),
+        applied: (session: AcpSession) => session.modes?.currentModeId,
+        expected: 'code'
+      },
+      {
+        name: 'setModel',
+        command: 'acp_set_model',
+        run: () => useAcpStore.getState().setModel('s1', 'm2'),
+        applied: (session: AcpSession) => session.models?.currentModelId,
+        expected: 'm2'
+      },
+      {
+        name: 'setConfigOption',
+        command: 'acp_set_config_option',
+        run: () => useAcpStore.getState().setConfigOption('s1', 'thought_level', 'max'),
+        applied: (session: AcpSession) => session.configOptions[0]?.currentValue,
+        expected: 'max'
+      }
+    ])('$name authenticates on demand and applies the value', async ({
+      command,
+      run,
+      applied,
+      expected
+    }) => {
+      seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Sign in with Cursor' }])
+      seedOptionsSession('s1', 'agent-1', {
+        modes: { currentModeId: 'ask', availableModes: [makeMode('ask'), makeMode('code')] },
+        models: { currentModelId: 'm1', availableModels: [makeModel('m1'), makeModel('m2')] },
+        configOptions: [makeConfigOption('thought_level', 'low', ['low', 'max'])]
+      })
+      let calls = 0
+      vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === 'acp_authenticate') return undefined
+        if (cmd === command) {
+          calls += 1
+          if (calls === 1) throw authRequiredError()
+          return null
+        }
+        throw new Error(`unexpected invoke command: ${cmd}`)
+      })
+
+      await run()
+
+      expect(vi.mocked(invoke).mock.calls.map(([cmd]) => cmd)).toEqual([
+        command,
+        'acp_authenticate',
+        command
+      ])
+      const session = useAcpStore.getState().sessions.s1
+      expect(session && applied(session)).toBe(expected)
+    })
+
+    it('discoverSessions authenticates on demand and lists the sessions', async () => {
+      seedLiveAgent('agent-1', [{ id: 'cursor_login', name: 'Sign in with Cursor' }], {
+        sessionCapabilities: { list: {} }
+      })
+      let calls = 0
+      vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+        if (cmd === 'acp_authenticate') return undefined
+        if (cmd === 'acp_list_sessions') {
+          calls += 1
+          if (calls === 1) throw authRequiredError()
+          return { sessions: [{ sessionId: 'ext-1', cwd: '/work' }] }
+        }
+        throw new Error(`unexpected invoke command: ${cmd}`)
+      })
+
+      await useAcpStore.getState().discoverSessions('agent-1', '/work')
+
+      expect(vi.mocked(invoke).mock.calls.map(([cmd]) => cmd)).toEqual([
+        'acp_list_sessions',
+        'acp_authenticate',
+        'acp_list_sessions'
+      ])
+      expect(Object.values(useAcpStore.getState().discoveredSessions)).toEqual([
+        [{ sessionId: 'ext-1', cwd: '/work' }]
+      ])
+    })
   })
 })

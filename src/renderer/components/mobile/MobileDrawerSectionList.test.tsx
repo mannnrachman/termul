@@ -37,25 +37,25 @@ const {
   mockCloseAgentChat: vi.fn()
 }))
 
-const { canvasRef, mockCloseCanvas, mockLogFrontendError } = vi.hoisted(() => ({
+const { canvasRef, mockUnmountCanvas, mockLogFrontendError } = vi.hoisted(() => ({
   // Canvas runtime sessions by project id (only `dirty` is read by the list).
   canvasRef: { current: {} as Record<string, { dirty: boolean }> },
-  mockCloseCanvas: vi.fn(),
+  mockUnmountCanvas: vi.fn(),
   mockLogFrontendError: vi.fn()
 }))
 
 vi.mock('@/stores/canvas-store', () => ({
   useCanvasStore: Object.assign(
     vi.fn((sel: (s: unknown) => unknown) => sel({ sessions: canvasRef.current })),
-    { getState: () => ({ sessions: canvasRef.current, closeCanvas: mockCloseCanvas }) }
+    { getState: () => ({ sessions: canvasRef.current, unmountCanvas: mockUnmountCanvas }) }
   )
 }))
 
 // MaterialFileIcon pulls in the app-settings store + an SVG resolver; stub it
 // with the inputs it resolves from.
 vi.mock('@/components/file-explorer/MaterialFileIcon', () => ({
-  MaterialFileIcon: ({ name, extension }: { name: string; extension: string | null }) => (
-    <span data-testid="file-icon" data-name={name} data-extension={extension ?? ''} />
+  MaterialFileIcon: ({ name }: { name: string }) => (
+    <span data-testid="file-icon" data-name={name} />
   )
 }))
 vi.mock('@/lib/log-api', () => ({ logFrontendError: mockLogFrontendError }))
@@ -172,7 +172,7 @@ function seedAllTabTypes(): void {
         path: 'src/c.ts'
       },
       { type: 'browser', id: 'browser-b1', browserTabId: 'b1' },
-      { type: 'canvas', id: 'canvas-p1', projectId: 'p1', docPath: '/proj/docs/Plan.op' },
+      { type: 'canvas', id: 'canvas-p1', projectId: 'p1', docPath: '/proj/docs/Plan.figcraft' },
       CHAT_TAB
     ],
     'tab-1'
@@ -187,7 +187,7 @@ beforeEach(() => {
   mockNavigate.mockReset()
   mockRemoveBrowserTab.mockReset()
   mockCloseAgentChat.mockReset()
-  mockCloseCanvas.mockReset().mockResolvedValue(undefined)
+  mockUnmountCanvas.mockReset().mockResolvedValue(undefined)
   mockLogFrontendError.mockReset()
   canvasRef.current = {}
   workspaceRef.current.removeTab.mockReset()
@@ -300,7 +300,13 @@ describe('MobileDrawerSectionList editors', () => {
     renderList({ section: 'editors' })
 
     const group = screen.getByRole('group', { name: 'Editors' })
-    for (const label of ['a.ts', 'Git Changes', 'c.ts @ e44b917', 'Example Site', 'Plan.op']) {
+    for (const label of [
+      'a.ts',
+      'Git Changes',
+      'c.ts @ e44b917',
+      'Example Site',
+      'Plan.figcraft'
+    ]) {
       expect(within(group).getByRole('button', { name: label })).toHaveClass('min-h-11')
       expect(within(group).getByRole('button', { name: `Close ${label}` })).toHaveClass('size-11')
     }
@@ -328,12 +334,10 @@ describe('MobileDrawerSectionList editors', () => {
     const icon = (name: string) =>
       within(screen.getByRole('button', { name })).getByTestId('file-icon')
     expect(icon('a.ts')).toHaveAttribute('data-name', 'a.ts')
-    expect(icon('a.ts')).toHaveAttribute('data-extension', 'ts')
-    expect(icon('Makefile')).toHaveAttribute('data-extension', '')
-    expect(icon('.env')).toHaveAttribute('data-extension', '')
-    expect(icon('types.d.ts')).toHaveAttribute('data-extension', 'ts')
+    expect(icon('Makefile')).toHaveAttribute('data-name', 'Makefile')
+    expect(icon('.env')).toHaveAttribute('data-name', '.env')
+    expect(icon('types.d.ts')).toHaveAttribute('data-name', 'types.d.ts')
     expect(icon('Main.CS')).toHaveAttribute('data-name', 'Main.CS')
-    expect(icon('Main.CS')).toHaveAttribute('data-extension', 'CS')
     expect(
       screen.getByRole('group', { name: 'Editors' }).querySelector('svg[data-termul-icon="Pencil"]')
     ).not.toBeInTheDocument()
@@ -343,7 +347,7 @@ describe('MobileDrawerSectionList editors', () => {
     seedAllTabTypes()
     renderList({ section: 'editors' })
 
-    const row = screen.getByRole('button', { name: 'Plan.op' })
+    const row = screen.getByRole('button', { name: 'Plan.figcraft' })
     expect(row.querySelector('svg[data-termul-icon="Edit2"]')).toBeInTheDocument()
   })
 
@@ -358,8 +362,8 @@ describe('MobileDrawerSectionList editors', () => {
     expect(screen.getByRole('button', { name: /^a\.ts/ })).toHaveAccessibleName(
       'a.ts, unsaved changes'
     )
-    expect(screen.getByRole('button', { name: /^Plan\.op/ })).toHaveAccessibleName(
-      'Plan.op, unsaved changes'
+    expect(screen.getByRole('button', { name: /^Plan\.figcraft/ })).toHaveAccessibleName(
+      'Plan.figcraft, unsaved changes'
     )
     expect(screen.getByTestId('canvas-dirty-dot').className).toBe(dot.className)
   })
@@ -385,8 +389,8 @@ describe('MobileDrawerSectionList editors', () => {
     expect(mockRemoveBrowserTab).toHaveBeenCalledWith('b1')
     expect(workspaceRef.current.removeTab).toHaveBeenCalledWith('browser-b1')
 
-    fireEvent.click(screen.getByRole('button', { name: 'Close Plan.op' }))
-    expect(mockCloseCanvas).toHaveBeenCalledWith('p1')
+    fireEvent.click(screen.getByRole('button', { name: 'Close Plan.figcraft' }))
+    expect(mockUnmountCanvas).not.toHaveBeenCalled()
     expect(workspaceRef.current.removeTab).toHaveBeenCalledWith('canvas-p1')
 
     fireEvent.click(screen.getByRole('button', { name: 'Close Git Changes' }))

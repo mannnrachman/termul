@@ -30,7 +30,21 @@ vi.mock('@tanstack/react-virtual', async (importActual) => {
 })
 
 vi.mock('./ChatMessage', () => ({
-  AgentProse: ({ text }: { text: string }) => <div data-testid="agent-prose">{text}</div>,
+  AgentProse: ({
+    text,
+    filePathContext
+  }: {
+    text: string
+    filePathContext?: { cwd?: string; projectRoot?: string }
+  }) => (
+    <div
+      data-testid="agent-prose"
+      data-cwd={filePathContext?.cwd}
+      data-project-root={filePathContext?.projectRoot}
+    >
+      {text}
+    </div>
+  ),
   ChatMessage: ({
     message
   }: {
@@ -87,6 +101,8 @@ const toolItem: TimelineItem = {
   tool: {
     toolCallId: 'tool-1',
     title: 'Reading files',
+    kind: 'read',
+    rawInput: { path: 'src/a.ts' },
     status: 'in_progress',
     timestamp: 1_500,
     seq: 2
@@ -104,6 +120,8 @@ const failedToolItem: TimelineItem = {
   tool: {
     toolCallId: 'tool-failed',
     title: 'Run checks',
+    kind: 'execute',
+    rawInput: { command: 'bun run checks' },
     status: 'failed',
     timestamp: 2_000,
     seq: 2
@@ -213,6 +231,296 @@ describe('ChatMessageList', () => {
     expect(screen.getByText('Final response')).toBeInTheDocument()
   })
 
+  it("rolls the turn's tool calls into one nested disclosure", () => {
+    render(
+      <ChatMessageList
+        items={[userItem, completedToolItem, finalAgentItem]}
+        sessionId="session-1"
+        showRunningIndicator={false}
+      />
+    )
+
+    // The rollup lives one level deep: it mounts only once the turn row opens.
+    expect(screen.queryByRole('button', { name: 'Read 1 file' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Worked for 3s' }))
+
+    const group = screen.getByRole('button', { name: 'Read 1 file' })
+    expect(group).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByText('a.ts')).not.toBeInTheDocument()
+
+    fireEvent.click(group)
+    expect(group).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByText('a.ts')).toBeInTheDocument()
+  })
+
+  it('starts a live run with an unfinished call collapsed', () => {
+    render(
+      <ChatMessageList items={[userItem, toolItem]} sessionId="session-1" showRunningIndicator />
+    )
+
+    expect(screen.getByRole('button', { name: 'Read 1 file' })).toHaveAttribute(
+      'aria-expanded',
+      'false'
+    )
+    expect(screen.queryByText('Reading a.ts…')).toBeNull()
+  })
+
+  it('keeps a run collapsed as a thought joins it and narration lands', () => {
+    const { rerender } = render(
+      <ChatMessageList
+        items={[userItem, completedToolItem]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Read 1 file' })).toHaveAttribute(
+      'aria-expanded',
+      'false'
+    )
+
+    rerender(
+      <ChatMessageList
+        items={[userItem, completedToolItem, thoughtItem]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Thought, read 1 file' })).toHaveAttribute(
+      'aria-expanded',
+      'false'
+    )
+
+    rerender(
+      <ChatMessageList
+        items={[userItem, completedToolItem, thoughtItem, streamingAgentItem]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Thought, read 1 file' })).toHaveAttribute(
+      'aria-expanded',
+      'false'
+    )
+  })
+
+  it('keeps both an earlier run and the live run collapsed', () => {
+    const midReply: TimelineItem = {
+      kind: 'message',
+      key: 'mid-1',
+      message: {
+        id: 'mid-1',
+        role: 'agent',
+        blocks: [{ type: 'text', text: 'Read it, now building' }],
+        streaming: true,
+        timestamp: 1_600,
+        seq: 3
+      }
+    }
+    const buildTool: TimelineItem = {
+      kind: 'tool',
+      key: 'tool-2',
+      tool: {
+        toolCallId: 'tool-2',
+        title: 'Build',
+        kind: 'execute',
+        rawInput: { command: 'bun run build' },
+        status: 'in_progress',
+        timestamp: 1_700,
+        seq: 4
+      }
+    }
+    render(
+      <ChatMessageList
+        items={[userItem, completedToolItem, midReply, buildTool]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+
+    expect(screen.getByRole('button', { name: 'Read 1 file' })).toHaveAttribute(
+      'aria-expanded',
+      'false'
+    )
+    expect(screen.getByRole('button', { name: 'Ran 1 command' })).toHaveAttribute(
+      'aria-expanded',
+      'false'
+    )
+  })
+
+  it('updates a growing run label in place without animating the old label out', () => {
+    const secondRead: TimelineItem = {
+      kind: 'tool',
+      key: 'tool-2',
+      tool: {
+        toolCallId: 'tool-2',
+        title: 'Read b',
+        kind: 'read',
+        rawInput: { path: 'src/b.ts' },
+        status: 'completed',
+        timestamp: 1_600,
+        seq: 3
+      }
+    }
+    const { rerender } = render(
+      <ChatMessageList
+        items={[userItem, completedToolItem]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+    expect(screen.getByText('Read 1 file')).toBeInTheDocument()
+
+    rerender(
+      <ChatMessageList
+        items={[userItem, completedToolItem, secondRead]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+    expect(screen.queryByText('Read 1 file')).toBeNull()
+    expect(screen.getAllByText('Read 2 files')).toHaveLength(1)
+  })
+
+  it('shimmers the live run label until narration lands', () => {
+    const { rerender } = render(
+      <ChatMessageList
+        items={[userItem, completedToolItem]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+    const label = (): Element | null =>
+      screen.getByRole('button', { name: 'Read 1 file' }).querySelector('.t-think')
+    expect(label()).not.toHaveClass('is-settled')
+
+    rerender(
+      <ChatMessageList
+        items={[userItem, completedToolItem, streamingAgentItem]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+    expect(label()).toHaveClass('is-settled')
+  })
+
+  it('keeps a manually opened live run open as more calls join it', () => {
+    const secondRead: TimelineItem = {
+      kind: 'tool',
+      key: 'tool-2',
+      tool: {
+        toolCallId: 'tool-2',
+        title: 'Read b',
+        kind: 'read',
+        rawInput: { path: 'src/b.ts' },
+        status: 'in_progress',
+        timestamp: 1_600,
+        seq: 3
+      }
+    }
+    const { rerender } = render(
+      <ChatMessageList items={[userItem, toolItem]} sessionId="session-1" showRunningIndicator />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Read 1 file' }))
+    expect(screen.getByRole('button', { name: 'Read 1 file' })).toHaveAttribute(
+      'aria-expanded',
+      'true'
+    )
+
+    rerender(
+      <ChatMessageList
+        items={[userItem, toolItem, secondRead]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+    expect(screen.getByRole('button', { name: 'Read 2 files' })).toHaveAttribute(
+      'aria-expanded',
+      'true'
+    )
+    expect(screen.getByText('Reading b.ts…')).toBeInTheDocument()
+  })
+
+  it('folds a failed run once activity moves past it and flags it red', () => {
+    render(
+      <ChatMessageList
+        items={[userItem, failedToolItem, streamingAgentItem]}
+        sessionId="session-1"
+        showRunningIndicator
+      />
+    )
+
+    const trigger = screen.getByRole('button', { name: 'Ran 1 command' })
+    expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    expect(trigger).toHaveClass('text-destructive')
+  })
+
+  it('splits tool calls into per-run groups around an in-turn reply', () => {
+    const buildTool: TimelineItem = {
+      kind: 'tool',
+      key: 'tool-2',
+      tool: {
+        toolCallId: 'tool-2',
+        title: 'Build',
+        kind: 'execute',
+        rawInput: { command: 'bun run build' },
+        status: 'completed',
+        timestamp: 1_600,
+        seq: 3
+      }
+    }
+    const midReply: TimelineItem = {
+      kind: 'message',
+      key: 'mid-1',
+      message: {
+        id: 'mid-1',
+        role: 'agent',
+        blocks: [{ type: 'text', text: 'Build failed, checking the file' }],
+        streaming: false,
+        timestamp: 1_700,
+        seq: 4
+      }
+    }
+    const searchTool: TimelineItem = {
+      kind: 'tool',
+      key: 'tool-3',
+      tool: {
+        toolCallId: 'tool-3',
+        title: 'Search',
+        kind: 'search',
+        rawInput: { query: 'tsconfig' },
+        status: 'completed',
+        timestamp: 1_800,
+        seq: 5
+      }
+    }
+    render(
+      <ChatMessageList
+        items={[userItem, completedToolItem, buildTool, midReply, searchTool, finalAgentItem]}
+        sessionId="session-1"
+        showRunningIndicator={false}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Worked for 3s' }))
+
+    const firstRun = screen.getByRole('button', { name: 'Read 1 file, ran 1 command' })
+    const secondRun = screen.getByRole('button', { name: 'Ran 1 search' })
+    const reply = screen.getByText('Build failed, checking the file')
+    // The in-turn reply keeps its seat: run, reply, run.
+    expect(firstRun.compareDocumentPosition(reply) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(reply.compareDocumentPosition(secondRun) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+
+    // Each group expands to only its own calls.
+    fireEvent.click(firstRun)
+    expect(screen.getByText('a.ts')).toBeInTheDocument()
+    expect(screen.getByText('bun run build')).toBeInTheDocument()
+    expect(screen.queryByText('tsconfig')).not.toBeInTheDocument()
+
+    fireEvent.click(secondRun)
+    expect(screen.getByText('tsconfig')).toBeInTheDocument()
+  })
+
   it('keeps delegation details open when the parent turn completes', async () => {
     const delegation: TimelineItem = {
       kind: 'tool',
@@ -238,6 +546,9 @@ describe('ChatMessageList', () => {
       />
     )
 
+    // The finished run folded once the streaming reply took the live tail —
+    // open it to reach the delegation card.
+    fireEvent.click(screen.getByRole('button', { name: 'Ran 1 agent' }))
     fireEvent.click(screen.getByRole('button', { name: /audit branch/i }))
     expect(screen.getByRole('dialog', { name: 'Audit branch' })).toHaveTextContent('Running')
 
@@ -260,16 +571,55 @@ describe('ChatMessageList', () => {
       />
     )
 
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: 'Worked for 3s' })).toHaveAttribute(
-        'aria-expanded',
-        'false'
-      )
-      expect(within(screen.getByRole('log')).queryByText('Audit branch')).not.toBeInTheDocument()
-    })
+    await waitFor(
+      () => {
+        expect(screen.getByRole('button', { name: 'Worked for 3s' })).toHaveAttribute(
+          'aria-expanded',
+          'false'
+        )
+        expect(within(screen.getByRole('log')).queryByText('Audit branch')).not.toBeInTheDocument()
+      },
+      { timeout: 5000 }
+    )
     expect(screen.getByRole('dialog', { name: 'Audit branch' })).toHaveTextContent(
       'No changes needed.'
     )
+  })
+
+  it('passes the chat file-path context to subagent result prose', () => {
+    const delegation: TimelineItem = {
+      kind: 'tool',
+      key: 'task-1',
+      tool: {
+        toolCallId: 'task-1',
+        title: 'Audit branch',
+        kind: 'think',
+        status: 'completed',
+        rawInput: { subagent_type: 'explorer', description: 'Audit branch' },
+        rawOutput: { text: 'Edited src/foo.ts.' },
+        timestamp: 1_500,
+        seq: 2
+      }
+    }
+    render(
+      <ChatMessageList
+        items={[userItem, delegation, finalAgentItem]}
+        sessionId="session-1"
+        showRunningIndicator={false}
+        filePathContext={{ cwd: '/proj/sub', projectRoot: '/proj' }}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Worked for 3s' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Ran 1 agent' }))
+    fireEvent.click(screen.getByRole('button', { name: /audit branch/i }))
+
+    const prose = within(screen.getByRole('dialog', { name: 'Audit branch' })).getByTestId(
+      'agent-prose'
+    )
+    expect(prose).toHaveTextContent('Edited src/foo.ts.')
+    expect(prose).toHaveAttribute('data-cwd', '/proj/sub')
+    expect(prose).toHaveAttribute('data-project-root', '/proj')
   })
 
   it('allows keyboard-accessible reopening after completion', () => {
@@ -356,7 +706,7 @@ describe('ChatMessageList', () => {
     )
 
     expect(screen.getByTestId('message-agent-1')).toBe(liveNode)
-    expect(screen.getByText('Reading files…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Read 1 file' })).toBeInTheDocument()
   })
 
   it('collapses a failed tool-only turn but flags it for attention', () => {
@@ -370,6 +720,13 @@ describe('ChatMessageList', () => {
 
     const trigger = screen.getByRole('button', { name: /Worked.*needs attention/ })
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
+
+    fireEvent.click(trigger)
+    const run = screen.getByRole('button', { name: 'Ran 1 command' })
+    expect(run).toHaveAttribute('aria-expanded', 'false')
+    expect(run).toHaveClass('text-destructive')
+    fireEvent.click(run)
+    expect(screen.getByText('bun run checks')).toBeInTheDocument()
   })
 })
 

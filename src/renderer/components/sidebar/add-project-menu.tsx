@@ -1,12 +1,11 @@
-import { useState } from 'react'
 import { FolderPlus, Plus } from '@/components/icons'
+import { RailTooltip } from '@/components/shell/rail-button'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
-import { useNativeWebviewOcclusion } from '@/hooks/use-native-webview-occlusion'
 
 interface AddProjectMenuProps {
   onNewProject: () => void
@@ -18,29 +17,26 @@ interface AddProjectMenuProps {
 /**
  * The Rail's single `+` in the Projects header: a menu with `New project` and
  * `New folder group`, replacing the two header buttons of the classic sidebar.
- * Native browser webviews stay hidden while the menu is open.
  */
 export function AddProjectMenu({
   onNewProject,
   onNewGroup,
   buttonClassName
 }: AddProjectMenuProps): React.JSX.Element {
-  const [open, setOpen] = useState(false)
-  useNativeWebviewOcclusion(open)
-
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          className={buttonClassName}
-          title="Add project or folder group"
-          aria-label="Add project or folder group"
-          data-testid="header-add-menu"
-        >
-          <Plus size={14} />
-        </button>
-      </DropdownMenuTrigger>
+    <DropdownMenu>
+      <RailTooltip label="Add project or folder group">
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            className={buttonClassName}
+            aria-label="Add project or folder group"
+            data-testid="header-add-menu"
+          >
+            <Plus size={14} />
+          </button>
+        </DropdownMenuTrigger>
+      </RailTooltip>
       <DropdownMenuContent align="end">
         <DropdownMenuItem onSelect={onNewProject} data-testid="header-new-project">
           <Plus size={14} aria-hidden="true" className="mr-2 text-muted-foreground" />

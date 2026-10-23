@@ -3,6 +3,7 @@ import type { StoredAgentConfig } from '@/lib/acp-agents-persistence'
 import type { SupportedAcpAgentEntry } from '@/lib/agents/supported-acp-agents'
 import {
   buildAgentTabs,
+  capabilitySummary,
   catalogFromPersisted,
   catalogFromSessionState,
   entryDisableReason,
@@ -120,6 +121,30 @@ describe('model catalogs', () => {
     expect(catalog).toMatchObject({ id: 'model', source: 'config', currentValue: 'x' })
   })
 
+  it('lists the models inside grouped select options', () => {
+    const catalog = catalogFromSessionState(models, [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: 'gemini-flash',
+        options: [
+          { value: 'gemini-flash', name: 'Gemini Flash' },
+          {
+            group: 'anthropic',
+            name: 'Anthropic',
+            options: [{ value: 'claude-sonnet', name: 'Claude Sonnet', description: 'Balanced' }]
+          }
+        ]
+      }
+    ])
+    expect(catalog?.options).toEqual([
+      { value: 'gemini-flash', name: 'Gemini Flash', description: null },
+      { value: 'claude-sonnet', name: 'Claude Sonnet', description: 'Balanced' }
+    ])
+  })
+
   it('falls back to the native model state', () => {
     expect(catalogFromSessionState(models, [])).toEqual({
       id: 'model',
@@ -151,5 +176,47 @@ describe('entryDisableReason', () => {
     expect(entryDisableReason(entry(null, 'x', 'unavailable'))).toBe(
       'Not available on this platform'
     )
+  })
+})
+
+describe('capabilitySummary', () => {
+  it('lists the prompt content and MCP transports the agent advertises', () => {
+    expect(
+      capabilitySummary({
+        promptCapabilities: { image: true, audio: false, embeddedContext: true },
+        mcpCapabilities: { http: true, sse: false }
+      })
+    ).toBe('Accepts: Text · Images · Embedded context\nMCP servers: stdio · HTTP')
+  })
+
+  it('lists SSE and audio when the agent advertises them', () => {
+    expect(
+      capabilitySummary({
+        promptCapabilities: { audio: true },
+        mcpCapabilities: { http: true, sse: true }
+      })
+    ).toBe('Accepts: Text · Audio (cannot attach yet)\nMCP servers: stdio · HTTP · SSE')
+  })
+
+  it('names the baseline when the agent advertises nothing beyond it', () => {
+    expect(
+      capabilitySummary({
+        promptCapabilities: { image: false, audio: false, embeddedContext: false },
+        mcpCapabilities: { http: false, sse: false }
+      })
+    ).toBe('Accepts: Text only\nMCP servers: stdio only')
+  })
+
+  it('shows only the block the agent advertised', () => {
+    expect(capabilitySummary({ mcpCapabilities: { sse: true } })).toBe('MCP servers: stdio · SSE')
+  })
+
+  it.each([
+    ['no capabilities', undefined],
+    ['null capabilities', null],
+    ['capabilities without either field', { loadSession: true }],
+    ['null capability fields', { promptCapabilities: null, mcpCapabilities: null }]
+  ] as const)('is null for %s', (_name, capabilities) => {
+    expect(capabilitySummary(capabilities)).toBeNull()
   })
 })

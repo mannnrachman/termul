@@ -78,6 +78,7 @@ impl<T> IpcResult<T> {
 pub mod acp_history;
 pub mod browser;
 pub mod canvas;
+pub mod diagnostics;
 pub mod git;
 pub mod migrations;
 pub mod misc;
@@ -86,6 +87,7 @@ pub mod project_icon;
 pub mod remote;
 pub mod search;
 pub(crate) mod search_dirs;
+pub(crate) mod search_file_hits;
 pub mod ssh;
 pub mod terminal;
 pub mod workspace;
@@ -94,6 +96,7 @@ pub mod worktree;
 pub use acp_history::*;
 pub use browser::*;
 pub use canvas::*;
+pub use diagnostics::*;
 pub use git::*;
 pub use migrations::*;
 pub use misc::*;
@@ -117,6 +120,9 @@ mod tests;
 mod search_dirs_tests;
 
 #[cfg(test)]
+mod search_file_hits_tests;
+
+#[cfg(test)]
 mod remote_sync_mcp_registry_tests;
 
 #[cfg(test)]
@@ -124,3 +130,6 @@ mod forwarder_teardown_tests;
 
 #[cfg(test)]
 mod terminal_tests;
+
+#[cfg(test)]
+mod worktree_tests;

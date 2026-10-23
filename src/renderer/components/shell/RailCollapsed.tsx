@@ -1,5 +1,6 @@
-import { Edit2, Search, SlidersHorizontal } from '@/components/icons'
+import { Bug, Edit2, Search, SlidersHorizontal } from '@/components/icons'
 import { RailColumnIcons } from '@/components/shell/RailColumnIcons'
+import { RailUtilityButtons } from '@/components/shell/RailFooter'
 import { RailProjectStack } from '@/components/shell/RailProjectStack'
 import { RailToggleButton } from '@/components/shell/RailToggleButton'
 import { RailButton } from '@/components/shell/rail-button'
@@ -9,6 +10,7 @@ import { useTopRowPlatform } from '@/components/shell/top-row-context'
 import { useTrafficLightInset } from '@/components/shell/traffic-light-inset'
 import { useShortcutLabel } from '@/components/shell/use-shortcut-label'
 import { cn } from '@/lib/utils'
+import { useReportBugStore } from '@/stores/report-bug-store'
 import { useSettingsModalStore, useSettingsModalView } from '@/stores/settings-modal-store'
 import type { Project } from '@/types/project'
 
@@ -23,22 +25,59 @@ interface RailCollapsedProps {
   onSSHConnect: (profileId: string) => void
   onSelectSSHProfile: (profileId: string) => void
   activeSSHProfileId: string | null
+  isShortcutsOpen: boolean
+  onShortcutsOpenChange: (open: boolean) => void
+  isThemePickerOpen: boolean
+  onToggleThemePicker?: () => void
 }
 
 const NEED_PROJECT = 'Open a project first'
 
-/** Shared slide of the mark / toggle swap: instant under reduced motion. */
-const SWAP_MOTION =
-  'absolute inset-0 flex items-center justify-center transition-[translate,opacity] duration-[220ms] ease-out motion-reduce:transition-none'
+/**
+ * Mark / toggle swap: an icon cross-fade on the motion tokens. The hidden icon
+ * sits 8px off, at 0.96 and blurred 2px. 250ms both ways. Under reduced motion
+ * only the opacity fades.
+ */
+const SWAP_MOTION = cn(
+  'absolute inset-0 flex items-center justify-center',
+  'transition-[translate,scale,opacity,filter] duration-[var(--duration-fast)] ease-[ease-in-out]',
+  'motion-reduce:translate-x-0! motion-reduce:scale-100! motion-reduce:blur-none! motion-reduce:transition-opacity'
+)
+/**
+ * Hover-in waits 80ms so a pointer that only crosses the Rail does not swap.
+ * Hover-out and keyboard focus have no delay.
+ */
+const HOVER_IN_DELAY = 'group-hover/rail:delay-[var(--duration-micro)]'
+
+/** At rest: shown. On Rail hover or toggle focus: 8px right, 0.96, blurred, faded. */
+const MARK_STATES = [
+  'group-hover/rail:translate-x-[var(--distance-base)] group-hover/rail:scale-[var(--scale-large)] group-hover/rail:opacity-0 group-hover/rail:blur-[var(--blur-small)]',
+  'group-focus-within/swap:translate-x-[var(--distance-base)] group-focus-within/swap:scale-[var(--scale-large)] group-focus-within/swap:opacity-0 group-focus-within/swap:blur-[var(--blur-small)]',
+  '[@media(any-hover:none)]:pointer-events-none [@media(any-hover:none)]:opacity-0'
+]
+
+/** At rest: 8px left, 0.96, blurred, faded. On Rail hover, toggle focus or no hover input: shown. */
+const TOGGLE_STATES = [
+  '-translate-x-[var(--distance-base)] scale-[var(--scale-large)] opacity-0 blur-[var(--blur-small)]',
+  'group-hover/rail:translate-x-0 group-hover/rail:scale-100 group-hover/rail:opacity-100 group-hover/rail:blur-none',
+  'group-focus-within/swap:translate-x-0 group-focus-within/swap:scale-100 group-focus-within/swap:opacity-100 group-focus-within/swap:blur-none',
+  '[@media(any-hover:none)]:translate-x-0 [@media(any-hover:none)]:scale-100 [@media(any-hover:none)]:opacity-100 [@media(any-hover:none)]:blur-none'
+]
 
 /**
  * The Termul mark and the Rail toggle share one clipped 36px slot. At rest
- * the mark shows and the toggle waits off to the left, transparent. While
- * the pointer is over the Rail (`group/rail` on the nav) the toggle slides
- * in left to right and the mark slides out to the right; leaving reverses
- * it. Keyboard focus on the toggle shows it too, and on a touch screen
- * (`any-pointer-coarse`, which also covers touch laptops) the toggle always
- * shows. The slide takes 220ms.
+ * the mark shows and the toggle waits 8px to the left, faded and blurred.
+ * While the pointer is over the Rail (`group/rail` on the nav) the two
+ * cross-fade after an 80ms intent delay: the toggle comes in left to right
+ * and the mark drifts out to the right. Leaving reverses it at once.
+ * Keyboard focus on the toggle shows it with no delay.
+ *
+ * When no connected input can hover (`any-hover: none` — phones, tablets, a
+ * laptop in tablet mode) the toggle stays pinned because nothing can trigger
+ * the swap. A touchscreen laptop driven by mouse or trackpad keeps the
+ * mark-first swap (a finger tap still pops the toggle through sticky
+ * tap-hover), and the pinned state drops the mark's pointer events so its
+ * invisible drag region never swallows a tap meant for the toggle.
  */
 function BrandToggleSwap({ dragRegion }: { dragRegion: boolean }): React.JSX.Element {
   return (
@@ -48,25 +87,14 @@ function BrandToggleSwap({ dragRegion }: { dragRegion: boolean }): React.JSX.Ele
       data-tauri-drag-region={dragRegion ? true : undefined}
     >
       <span
-        className={cn(
-          SWAP_MOTION,
-          'group-hover/rail:translate-x-full group-hover/rail:opacity-0',
-          'group-focus-within/swap:translate-x-full group-focus-within/swap:opacity-0',
-          'any-pointer-coarse:opacity-0'
-        )}
+        className={cn(SWAP_MOTION, HOVER_IN_DELAY, MARK_STATES)}
         data-testid="rail-brand-swap-mark"
         data-tauri-drag-region={dragRegion ? true : undefined}
       >
         <ShellBrandMark dragRegion={dragRegion} />
       </span>
       <span
-        className={cn(
-          SWAP_MOTION,
-          '-translate-x-full opacity-0',
-          'group-hover/rail:translate-x-0 group-hover/rail:opacity-100',
-          'group-focus-within/swap:translate-x-0 group-focus-within/swap:opacity-100',
-          'any-pointer-coarse:translate-x-0 any-pointer-coarse:opacity-100'
-        )}
+        className={cn(SWAP_MOTION, HOVER_IN_DELAY, TOGGLE_STATES)}
         data-testid="rail-brand-swap-toggle"
       >
         {/* The slot clips at 36px, so the focus ring is drawn inside. */}
@@ -80,8 +108,8 @@ function BrandToggleSwap({ dragRegion }: { dragRegion: boolean }): React.JSX.Ele
  * Collapsed Rail body (48px): the top band (the 8px window gutter plus the
  * Rail's 40px part of the top row) with the mark / Rail toggle swap, the
  * project stack with status, the Column tab icons (Chats, Explorer, Changes)
- * in a track, Search, Canvas, SSH, then Settings pinned at the bottom. No
- * Theme or Shortcuts buttons here.
+ * in a track, Search, Canvas, SSH, then Theme, Shortcuts and Settings pinned
+ * at the bottom.
  */
 export function RailCollapsed({
   projects,
@@ -93,7 +121,11 @@ export function RailCollapsed({
   canOpenCanvas,
   onSSHConnect,
   onSelectSSHProfile,
-  activeSSHProfileId
+  activeSSHProfileId,
+  isShortcutsOpen,
+  onShortcutsOpenChange,
+  isThemePickerOpen,
+  onToggleThemePicker
 }: RailCollapsedProps): React.JSX.Element {
   const settingsView = useSettingsModalView()
   const platform = useTopRowPlatform()
@@ -164,8 +196,18 @@ export function RailCollapsed({
         </div>
       </div>
 
-      {/* Settings stays pinned at the bottom. */}
+      {/* Theme, Shortcuts, Settings and Report a bug stay pinned at the
+          bottom; Settings then Report a bug — the same relative pair order
+          as the expanded footer. */}
       <div className="mt-auto flex flex-col items-center gap-1">
+        <RailUtilityButtons
+          isShortcutsOpen={isShortcutsOpen}
+          onShortcutsOpenChange={onShortcutsOpenChange}
+          isThemePickerOpen={isThemePickerOpen}
+          onToggleThemePicker={onToggleThemePicker}
+          size="md"
+          className="flex-col gap-1"
+        />
         <RailButton
           label="Settings"
           hint={settingsShortcut}
@@ -174,6 +216,13 @@ export function RailCollapsed({
           onClick={() => useSettingsModalStore.getState().openApp()}
         >
           <SlidersHorizontal size={16} />
+        </RailButton>
+        <RailButton
+          label="Report a bug"
+          aria-label="Report a bug"
+          onClick={() => useReportBugStore.getState().openReport()}
+        >
+          <Bug size={16} />
         </RailButton>
       </div>
     </div>

@@ -4,6 +4,7 @@ import { toast } from 'sonner'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
 import { clipboardApi, openerApi } from '@/lib/api'
+import { isCanvasDocPath } from '@/lib/canvas-doc'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { useCanvasStore } from '@/stores/canvas-store'
 import { useConnectionStatusStore } from '@/stores/connection-status-store'
@@ -35,13 +36,13 @@ import { useExplorerKeyboard } from './use-explorer-keyboard'
 import { useExplorerSearch } from './use-explorer-search'
 
 /**
- * Pure gate for the `.op` open branch (OpenPencil canvas mode): desktop-width
- * viewports open the document as the canvas; the phone-width shell falls
+ * Pure gate for the canvas open branch: on desktop-width viewports a
+ * `.figcraft` document opens as the canvas; the phone-width shell falls
  * through to the existing text-editor flow (canvas is gated off there — the
  * facade would answer UNSUPPORTED_SURFACE anyway).
  */
 export function shouldOpenAsCanvas(path: string, isMobileWebShell: boolean): boolean {
-  return !isMobileWebShell && path.toLowerCase().endsWith('.op')
+  return !isMobileWebShell && isCanvasDocPath(path)
 }
 
 function copyPath(path: string): void {
@@ -77,6 +78,23 @@ async function showInFileManager(path: string): Promise<void> {
   }
 }
 
+/** Deleting more than this many entries lists a count instead of their names. */
+const MAX_NAMED_DELETE_TARGETS = 3
+
+function deleteDialogTitle(targets: DirectoryEntry[]): string {
+  if (targets.length > 1) return `Delete ${targets.length} items`
+  return targets[0]?.type === 'directory' ? 'Delete folder' : 'Delete file'
+}
+
+function deleteDialogMessage(targets: DirectoryEntry[]): string {
+  if (targets.length === 0) return ''
+  const subject =
+    targets.length <= MAX_NAMED_DELETE_TARGETS
+      ? targets.map((entry) => `"${entry.name}"`).join(', ')
+      : `${targets.length} items`
+  return `Delete ${subject}? This cannot be undone.`
+}
+
 /**
  * File Explorer. Always fills its host column (the shell Side panel): the
  * column owns the width and the resize handle.
@@ -91,8 +109,7 @@ export function FileExplorer(): React.JSX.Element {
     rootLoadError,
     // (loadingDirs intentionally not subscribed — the recovery effect reads
     // it imperatively via getState() to dodge the auto-expand race.)
-    selectedPaths,
-    clipboard
+    selectedPaths
   } = useFileExplorer()
   const {
     toggleDirectory,
@@ -157,17 +174,17 @@ export function FileExplorer(): React.JSX.Element {
     selectedPaths,
     directoryContents,
     onRename: flows.startRename,
-    onDelete: flows.requestDelete
+    onDelete: flows.requestDeleteSelection
   })
 
   const openFileEntry = useCallback(
     async (path: string) => {
       selectPath(path)
-      // OpenPencil canvas mode (CAP-1): a `.op` document opens as the
+      // Canvas mode (CAP-1): a `.figcraft` document opens as the
       // project's singleton canvas tab on desktop-width viewports. On the
       // phone-width shell the canvas is gated off — fall through to the
-      // existing text-editor flow. A typed canvas failure (BINARY_NOT_FOUND,
-      // HANDSHAKE_TIMEOUT, …) also falls through — the failure itself is
+      // existing text-editor flow. A typed canvas failure (BUNDLE_LISTENER_DOWN,
+      // PATH_VALIDATION_FAILED, …) also falls through — the failure itself is
       // logged by canvas-store.openCanvas, and the file still opens in the
       // text editor instead of leaving it selected but unopened.
       if (shouldOpenAsCanvas(path, isMobileWebShell)) {
@@ -201,11 +218,11 @@ export function FileExplorer(): React.JSX.Element {
       // If right-clicking on a selected item, keep the current selection.
       // Stopping propagation also keeps the global `GlobalContextMenu` trigger
       // from firing over the file tree.
-      if (!selectedPaths.has(entry.path)) {
+      if (!useFileExplorerStore.getState().selectedPaths.has(entry.path)) {
         selectPath(entry.path)
       }
     },
-    [selectPath, selectedPaths]
+    [selectPath]
   )
 
   // Ctrl/Cmd+Click toggles, Shift+Click selects a range, a plain click
@@ -242,8 +259,7 @@ export function FileExplorer(): React.JSX.Element {
   // `<ContextMenu><ContextMenuTrigger asChild>{row}</ContextMenuTrigger>{...}</ContextMenu>`;
   // this callback supplies the declarative `<ContextMenuContent>` for a given
   // entry (icons on every item, desktop-only reveal/external-open gated by
-  // `isTauriContext()`). The selection count + clipboard presence are captured
-  // fresh on every render so the menu reflects the current multi-select state.
+  // `isTauriContext()`).
   const renderFileTreeContextMenu = useCallback(
     (entry: DirectoryEntry) => (
       <FileTreeContextMenuContent
@@ -260,8 +276,6 @@ export function FileExplorer(): React.JSX.Element {
         onOpenInTerminal={openInTerminal}
         onOpenWithExternal={openWithExternal}
         onShowInFileManager={showInFileManager}
-        selectedCount={selectedPaths.size}
-        hasClipboardContent={clipboard !== null}
       />
     ),
     [
@@ -272,15 +286,13 @@ export function FileExplorer(): React.JSX.Element {
       copySelected,
       cutSelected,
       paste,
-      duplicateSelected,
-      selectedPaths,
-      clipboard
+      duplicateSelected
     ]
   )
 
   const actionsDisabled = !rootPath || !!rootLoadError
   const showTree = !!rootPath && !!rootEntries && !rootLoadError && search.showsTree
-  const { deleteTarget } = flows
+  const { deleteTargets } = flows
 
   return (
     <div
@@ -338,9 +350,9 @@ export function FileExplorer(): React.JSX.Element {
       </ExplorerInlineInputProvider>
 
       <ConfirmDialog
-        isOpen={deleteTarget !== null}
-        title={deleteTarget?.type === 'directory' ? 'Delete folder' : 'Delete file'}
-        message={deleteTarget ? `Delete "${deleteTarget.name}"? This cannot be undone.` : ''}
+        isOpen={deleteTargets.length > 0}
+        title={deleteDialogTitle(deleteTargets)}
+        message={deleteDialogMessage(deleteTargets)}
         confirmLabel="Delete"
         variant="danger"
         isLoading={flows.isDeleting}

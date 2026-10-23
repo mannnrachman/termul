@@ -151,6 +151,7 @@ pub const WS_COMMAND_CLASSES: &[(&str, CommandClass)] = &[
     ("get_session_payload_tail", CommandClass::read()),
     ("list_acp_catalog", CommandClass::read()),
     ("set_catalog_opt_in", CommandClass::idempotent()),
+    ("fetch_acp_registry_snapshot", CommandClass::read()),
     ("install_acp_agent", CommandClass::command(Replay::Payload)),
     (
         "acp_deliver_auth_redirect",
@@ -167,8 +168,14 @@ pub const WS_COMMAND_CLASSES: &[(&str, CommandClass)] = &[
         "record_agent_switch",
         CommandClass::command(Replay::Payload),
     ),
+    ("mark_chat_read", CommandClass::idempotent()),
     ("watch", CommandClass::read()),
     ("unwatch", CommandClass::read()),
+    // The canvas gateway's renderer leg: re-sending a mount report or a
+    // reply converges (a resolved call ignores a second answer).
+    ("canvas_mount", CommandClass::idempotent()),
+    ("canvas_unmount", CommandClass::idempotent()),
+    ("canvas_reply", CommandClass::idempotent()),
 ];
 
 /// The class of a `/ws` request type; `None` for a type the host does not

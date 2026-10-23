@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use axum::body::Body;
 use axum::extract::Request;
-use axum::http::{header, HeaderValue, StatusCode, Uri};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tower_http::services::{ServeDir, ServeFile};
@@ -192,20 +192,29 @@ pub struct Assets;
 ///   routes like `/v1.2/home` (last segment `home`, no `.`) as assets.
 /// - Anything else (a client-side route, no `.` in the last segment) →
 ///   `index.html` (the SPA boots + routes client-side).
-pub async fn serve_embedded(uri: Uri) -> Response {
+///
+/// Every embedded response carries a content-hash `ETag`; a GET or HEAD whose
+/// `If-None-Match` names it gets `304 Not Modified` with no body. Other
+/// methods ignore the validator.
+pub async fn serve_embedded(method: Method, uri: Uri, headers: HeaderMap) -> Response {
+    let validators = if matches!(method, Method::GET | Method::HEAD) {
+        headers
+    } else {
+        HeaderMap::new()
+    };
     let path = uri.path().trim_start_matches('/');
 
     if path.is_empty() || path == INDEX_HTML {
-        return embedded_index();
+        return embedded_index(&validators);
     }
 
     match Assets::get(path) {
-        Some(file) => embedded_response(file.metadata.mimetype(), file.data, path),
+        Some(file) => embedded_file(file, path, &validators),
         None => {
             if last_segment_has_extension(path) {
                 (StatusCode::NOT_FOUND, "404 Not Found").into_response()
             } else {
-                embedded_index()
+                embedded_index(&validators)
             }
         }
     }
@@ -226,9 +235,9 @@ fn last_segment_has_extension(path: &str) -> bool {
 /// chunks absent from a new embed → 404 after an upgrade). The path-aware
 /// policy in [`embedded_response`] already gives it `no-cache,
 /// must-revalidate` — only `assets/` paths are immutable.
-fn embedded_index() -> Response {
+fn embedded_index(request: &HeaderMap) -> Response {
     match Assets::get(INDEX_HTML) {
-        Some(file) => embedded_response(file.metadata.mimetype(), file.data, INDEX_HTML),
+        Some(file) => embedded_file(file, INDEX_HTML, request),
         None => (
             StatusCode::NOT_FOUND,
             "web bundle not embedded — run `bun run build:web` before building",
@@ -260,14 +269,210 @@ fn embedded_response(mime: &str, data: Cow<'static, [u8]>, path: &str) -> Respon
     let mime_val = HeaderValue::from_str(mime)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     let mut resp = ([(header::CONTENT_TYPE, mime_val)], Body::from(data)).into_response();
-    let cache_control = if path.starts_with("assets/") {
+    resp.headers_mut()
+        .insert(header::CACHE_CONTROL, cache_control(path));
+    resp
+}
+
+fn cache_control(path: &str) -> HeaderValue {
+    if path.starts_with("assets/") {
         HeaderValue::from_static("public, max-age=31536000, immutable")
     } else {
         HeaderValue::from_static("no-cache, must-revalidate")
+    }
+}
+
+/// The tag is weak because the compression layer can re-encode the body, and
+/// `If-None-Match` compares weakly anyway.
+fn embedded_file(file: rust_embed::EmbeddedFile, path: &str, request: &HeaderMap) -> Response {
+    let opaque: String = file
+        .metadata
+        .sha256_hash()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let opaque = format!("\"{opaque}\"");
+    let mut resp = if if_none_match_names(request, &opaque) {
+        let mut resp = StatusCode::NOT_MODIFIED.into_response();
+        resp.headers_mut()
+            .insert(header::CACHE_CONTROL, cache_control(path));
+        resp
+    } else {
+        embedded_response(file.metadata.mimetype(), file.data, path)
     };
-    resp.headers_mut()
-        .insert(header::CACHE_CONTROL, cache_control);
+    let etag =
+        HeaderValue::from_str(&format!("W/{opaque}")).expect("a quoted hex tag is a valid header");
+    resp.headers_mut().insert(header::ETAG, etag);
     resp
+}
+
+fn if_none_match_names(request: &HeaderMap, opaque: &str) -> bool {
+    request
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.trim() == "*" || opaque_tags(value).any(|tag| tag == opaque))
+}
+
+/// RFC 9110 §13.1.2 entity-tag list. Commas inside a quoted tag belong to the
+/// tag, so the list is split on quotes, not commas.
+fn opaque_tags(list: &str) -> impl Iterator<Item = &str> {
+    let mut rest = list;
+    std::iter::from_fn(move || {
+        rest = rest.trim_start_matches([' ', '\t', ',']);
+        let tag = rest.strip_prefix("W/").unwrap_or(rest);
+        let end = tag.strip_prefix('"')?.find('"')? + 2;
+        let (opaque, tail) = tag.split_at(end);
+        rest = tail;
+        Some(opaque)
+    })
+}
+
+/// Embedded figcraft web bundle (spine AD-24), fetched by
+/// `scripts/canvas/fetch-figcraft-bundle.mjs` into `canvas/bundle/` before a
+/// release build and served under `/canvas/<id>/` by
+/// [`crate::canvas::static_server`]. Same mechanism as [`Assets`], so the
+/// desktop binary and `termul-server` carry one copy each with no Tauri
+/// resources. `#[allow_missing]` keeps dev/CI compiling without the fetch;
+/// requests then get the typed [`CODE_BUNDLE_MISSING`] response.
+#[derive(rust_embed::Embed)]
+#[folder = "../canvas/bundle/"]
+#[allow_missing = true]
+pub struct CanvasBundle;
+
+/// Stable error code for a request that reaches a build with no bundle.
+pub const CODE_BUNDLE_MISSING: &str = "BUNDLE_MISSING";
+
+/// Dev-only directory override for the bundle. Compiled out of release
+/// builds, which read the embedded set only (spine AD-22).
+#[cfg(debug_assertions)]
+pub const CANVAS_BUNDLE_DIR_ENV: &str = "TERMUL_FIGCRAFT_BUNDLE";
+
+struct BundleFile {
+    mime: &'static str,
+    data: Cow<'static, [u8]>,
+    opaque: String,
+}
+
+fn bundle_dir_override() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os(CANVAS_BUNDLE_DIR_ENV)
+            .map(PathBuf::from)
+            .filter(|dir| !dir.as_os_str().is_empty())
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+fn bundle_mime(path: &str) -> &'static str {
+    match path.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("txt" | "md") => "text/plain; charset=utf-8",
+        Some("png") => "image/png",
+        Some("svg") => "image/svg+xml",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        _ => "application/octet-stream",
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn read_bundle_file(path: &str) -> Option<BundleFile> {
+    use sha2::Digest as _;
+    if path
+        .split('/')
+        .any(|part| matches!(part, ".." | "." | "") || part.contains(['\\', ':']))
+    {
+        return None;
+    }
+    if let Some(dir) = bundle_dir_override() {
+        let data = std::fs::read(dir.join(path)).ok()?;
+        return Some(BundleFile {
+            mime: bundle_mime(path),
+            opaque: hex(&sha2::Sha256::digest(&data)),
+            data: Cow::Owned(data),
+        });
+    }
+    let file = CanvasBundle::get(path)?;
+    Some(BundleFile {
+        mime: bundle_mime(path),
+        opaque: hex(&file.metadata.sha256_hash()),
+        data: file.data,
+    })
+}
+
+/// Whether the active bundle source (the dev override directory, else the
+/// embedded set) holds an `index.html`.
+pub fn canvas_bundle_available() -> bool {
+    read_bundle_file(INDEX_HTML).is_some()
+}
+
+/// Typed 503 for a request that reaches a build without the bundle.
+pub fn canvas_bundle_missing_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        axum::Json(serde_json::json!({
+            "success": false,
+            "error": "the figcraft canvas bundle is not available in this build",
+            "code": CODE_BUNDLE_MISSING,
+        })),
+    )
+        .into_response()
+}
+
+/// Serve `path` (relative to the bundle root; empty means `index.html`) from
+/// the bundle. GET and HEAD only. Every response is `private, no-cache` with
+/// a content-hash `ETag`: the bundle sits behind a per-canvas credential, so
+/// it must revalidate rather than be replayed from a shared cache.
+pub fn canvas_bundle_response(method: &Method, path: &str, request: &HeaderMap) -> Response {
+    if !matches!(*method, Method::GET | Method::HEAD) {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+    }
+    let path = if path.is_empty() { INDEX_HTML } else { path };
+    let Some(file) = read_bundle_file(path) else {
+        return (StatusCode::NOT_FOUND, "404 Not Found").into_response();
+    };
+    let opaque = format!("\"{}\"", file.opaque);
+    let mut response = if if_none_match_names(request, &opaque) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        let body = if *method == Method::HEAD {
+            Body::empty()
+        } else {
+            Body::from(file.data)
+        };
+        (
+            [(header::CONTENT_TYPE, HeaderValue::from_static(file.mime))],
+            body,
+        )
+            .into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if let Ok(etag) = HeaderValue::from_str(&format!("W/{opaque}")) {
+        headers.insert(header::ETAG, etag);
+    }
+    response
 }
 
 #[cfg(test)]

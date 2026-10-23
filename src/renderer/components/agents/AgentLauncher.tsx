@@ -1,5 +1,6 @@
 import type { LastSelectedAgent, PersistedComposerOptions } from '@shared/types/persistence.types'
 import { PersistenceKeys } from '@shared/types/persistence.types'
+import type { BaseBranchInfo } from '@shared/types/worktree.types'
 import type { Editor } from '@tiptap/core'
 import { useIsPresent, useReducedMotion } from 'framer-motion'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
@@ -60,6 +61,7 @@ import {
   MENTION_SEARCHING_LABEL
 } from '@/components/chat/FileMentionMenu'
 import { SlashCommandMenu, type SlashMenuHandle } from '@/components/chat/SlashCommandMenu'
+import { SkillFilesProvider } from '@/components/chat/skill-file-links'
 import { useChatComposer } from '@/components/chat/use-chat-composer'
 import { useComposerAttachments } from '@/components/chat/use-composer-attachments'
 import {
@@ -98,7 +100,7 @@ import { isTauriContext } from '@/lib/tauri-runtime'
 import { terminalApi } from '@/lib/terminal-api'
 import { cn } from '@/lib/utils'
 import { randomUUID } from '@/lib/uuid'
-import { type BaseBranchInfo, worktreeApi } from '@/lib/worktree-api'
+import { worktreeApi } from '@/lib/worktree-api'
 import { getDefaultCwdForProject, getProjectRootPath } from '@/lib/worktree-context'
 import { READ_ONLY_SERVER_REASON } from '@/lib/write-gate'
 import {
@@ -1518,8 +1520,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
 
     // Build the wire text (skills framed by path under `# Agent Skills`, then
     // the user text with tokens replaced by `(name)`) and the display text (the
-    // raw token value, so the chat timeline re-renders inline chips), with the
-    // active command prefixed to both. Shared with `ChatInputBar.submit` via
+    // raw token value, so the chat timeline re-renders inline chips). A command
+    // token becomes `/name` where the user typed it. Shared with `ChatInputBar.submit` via
     // `useChatComposer.buildPromptParts` so the two surfaces cannot drift. A
     // skill surfaced without a path (web parity gap) blocks the launch —
     // `buildPromptParts` throws and the catch toasts + releases the in-flight
@@ -1993,7 +1995,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
                 factoryKeyAuth={factoryKeyAuth}
                 inlineKeyMethodId={inlineKeyMethodId}
               />
-              <AttachmentPreviewGroup attachments={attachments} onRemove={removeAttachment} />
+              <AttachmentPreviewGroup
+                attachments={attachments}
+                onRemove={removeAttachment}
+                removeDisabled={composerDisabled}
+              />
               {/* Same inner rhythm as the chat composer card (ChatInputBar):
                   editor row px-4 pb-1.5 pt-3.5, toolbar px-2 pb-2. */}
               <div className="px-4 pb-1.5 pt-3.5">
@@ -2003,28 +2009,30 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
                    overlay, no canvas padding. The `prompt` string (sentinel-token
                    format) is the shared model the wire builder + first-turn
                    sync + timeline consume (byte-identical wire payload). */}
-                <ChatComposerEditor
-                  value={prompt}
-                  onValueChange={setPrompt}
-                  onCaretChange={mentions.update}
-                  onBeforeEditorKeyDown={handleKeyDown}
-                  onPasteAttachments={handlePaste}
-                  getSkillPaths={() => skillPathsRef.current}
-                  editorRef={editorRef}
-                  inputRef={composerInputRef}
-                  disabled={composerDisabled}
-                  minHeight={76}
-                  maxHeight={160}
-                  placeholder={
-                    composerDisabled
-                      ? 'Composer unavailable'
-                      : hasCommandToken
-                        ? 'Add a message (optional)…'
-                        : 'Ask anything… (/ for commands, @ for files)'
-                  }
-                  ariaLabel="Agent prompt"
-                  autoFocus
-                />
+                <SkillFilesProvider projectRoot={skillsRoot}>
+                  <ChatComposerEditor
+                    value={prompt}
+                    onValueChange={setPrompt}
+                    onCaretChange={mentions.update}
+                    onBeforeEditorKeyDown={handleKeyDown}
+                    onPasteAttachments={handlePaste}
+                    getSkillPaths={() => skillPathsRef.current}
+                    editorRef={editorRef}
+                    inputRef={composerInputRef}
+                    disabled={composerDisabled}
+                    minHeight={76}
+                    maxHeight={160}
+                    placeholder={
+                      composerDisabled
+                        ? 'Composer unavailable'
+                        : hasCommandToken
+                          ? 'Add a message (optional)…'
+                          : 'Ask anything… (/ for commands, @ for files)'
+                    }
+                    ariaLabel="Agent prompt"
+                    autoFocus
+                  />
+                </SkillFilesProvider>
               </div>
               <LauncherToolbar
                 pickFiles={pickFiles}

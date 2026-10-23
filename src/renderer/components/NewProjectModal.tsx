@@ -3,21 +3,25 @@ import type { ProjectTemplate } from '@shared/types/project-template.types'
 import { AnimatePresence, motion } from 'framer-motion'
 import { type KeyboardEvent, useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { basename } from '@/components/chat/chat-attachments'
 import { ChevronDown, ChevronRight, X } from '@/components/icons'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { FIELD_FOCUS_CLASS, FOCUS_RING_CLASS } from '@/components/ui/panel-styles'
 import { Skeleton } from '@/components/ui/skeleton'
+import { NativeWebviewOccluder } from '@/hooks/use-native-webview-occlusion'
 import { dialogApi, filesystemApi, gitApi, shellApi } from '@/lib/api'
 import { availableColors, getColorClasses } from '@/lib/colors'
 import { claimEscape, isEscapeClaimed } from '@/lib/escape-claim'
+import { basename } from '@/lib/path-basename'
 import { BUILT_IN_TEMPLATES, scaffoldProject } from '@/lib/project-templates'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { cn } from '@/lib/utils'
 import { reconcileProjectWorktrees } from '@/lib/worktree-reconciler'
 import { useDefaultProjectColor } from '@/stores/app-settings-store'
-import { useOverlayRegistration } from '@/stores/overlay-stack-store'
+import {
+  NEW_PROJECT_MODAL_OVERLAY_PREFIX,
+  useOverlayRegistration
+} from '@/stores/overlay-stack-store'
 import { useProjectStore, useProjects } from '@/stores/project-store'
 import type { EnvVariable, Project, ProjectColor } from '@/types/project'
 
@@ -47,7 +51,7 @@ const DOUBLED_NAME_RE = /^(.{2,}?)\1$/
 
 export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProjectModalProps) {
   // Mobile web shell: system back closes this modal (inert on desktop).
-  const overlayId = `new-project-modal:${useId()}`
+  const overlayId = `${NEW_PROJECT_MODAL_OVERLAY_PREFIX}${useId()}`
   useOverlayRegistration(overlayId, isOpen, onClose, { mobileShellOnly: true })
   const defaultColor = useDefaultProjectColor() as ProjectColor
   // Simple defaults (empty template, app default color, detected default shell,
@@ -418,6 +422,7 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
           className="fixed inset-0 bg-overlay/60 backdrop-blur-sm z-50 flex items-center justify-center"
           onClick={onClose}
         >
+          <NativeWebviewOccluder />
           <motion.div
             initial={{ opacity: 0, scale: 0.95, y: 10 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}

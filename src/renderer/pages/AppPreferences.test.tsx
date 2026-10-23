@@ -2,6 +2,7 @@ import { PersistenceKeys } from '@shared/types/persistence.types'
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { acpApi } from '@/lib/api'
 import { useAppSettingsStore } from '@/stores/app-settings-store'
 import { useSettingsModalStore } from '@/stores/settings-modal-store'
 import { DEFAULT_APP_SETTINGS } from '@/types/settings'
@@ -22,7 +23,9 @@ vi.mock('@/lib/api', () => ({
     setTurnTimeout: vi.fn().mockResolvedValue({ success: true }),
     setTurnIdleTimeout: vi.fn().mockResolvedValue({ success: true }),
     setSessionNewTimeout: vi.fn().mockResolvedValue({ success: true }),
-    setSessionReopenTimeout: vi.fn().mockResolvedValue({ success: true })
+    setSessionReopenTimeout: vi.fn().mockResolvedValue({ success: true }),
+    setAgentIdleWindow: vi.fn().mockResolvedValue(undefined),
+    getAgentIdleWindow: vi.fn().mockResolvedValue({ secs: 1800, source: 'default' })
   },
   logApi: {
     revealLogDir: vi.fn(),
@@ -121,6 +124,10 @@ vi.mock('@/hooks/use-keyboard-shortcuts', () => ({
   useResetAllShortcuts: () => mockResetAllShortcuts
 }))
 
+vi.mock('@/hooks/use-agent-skills', () => ({
+  useAgentSkills: () => ({ skills: [], loading: false, reload: () => {} })
+}))
+
 vi.mock('@/components/settings/AcpAgentsSettings', () => ({
   AcpAgentsSettings: () => null
 }))
@@ -129,8 +136,51 @@ vi.mock('@/components/settings/McpServersSettings', () => ({
   McpServersSettings: () => null
 }))
 
+// Radix Select content does not render under jsdom. A native select keeps
+// the wiring (label → control → store) testable.
+vi.mock('@/components/settings/SettingsSelect', () => ({
+  SettingsSelect: ({
+    options,
+    value,
+    onValueChange,
+    disabled,
+    id,
+    'aria-label': ariaLabel,
+    'aria-describedby': ariaDescribedBy
+  }: {
+    options: ReadonlyArray<{ value: string; label: string }>
+    value?: string
+    onValueChange?: (value: string) => void
+    disabled?: boolean
+    id?: string
+    'aria-label'?: string
+    'aria-describedby'?: string
+  }) => (
+    <select
+      id={id}
+      aria-label={ariaLabel}
+      aria-describedby={ariaDescribedBy}
+      value={value}
+      disabled={disabled}
+      onChange={(e) => onValueChange?.(e.target.value)}
+    >
+      {options.map((option) => (
+        <option key={option.value} value={option.value}>
+          {option.label}
+        </option>
+      ))}
+    </select>
+  )
+}))
+
+/** Open a Preferences page from the sidebar. */
+function goTo(page: string): void {
+  const nav = screen.getByRole('navigation', { name: 'Settings pages' })
+  fireEvent.click(within(nav).getByRole('button', { name: page }))
+}
+
 function renderPage(): ReturnType<typeof render> {
-  useSettingsModalStore.setState({ view: 'app' })
+  useSettingsModalStore.setState({ view: 'app', appPage: null })
   return render(
     <MemoryRouter>
       <AppPreferencesModal />
@@ -147,8 +197,9 @@ describe('AppPreferences editor auto-save controls (GH-539)', () => {
 
   it('toggling the auto-save switch writes editorAutoSave (with correct negation)', async () => {
     renderPage()
+    goTo('Editor')
 
-    const toggle = await screen.findByRole('switch', { name: 'Enable auto save' })
+    const toggle = await screen.findByRole('switch', { name: 'Auto save' })
     expect(toggle).toHaveAttribute('aria-checked', 'false')
 
     fireEvent.click(toggle)
@@ -165,11 +216,13 @@ describe('AppPreferences editor auto-save controls (GH-539)', () => {
 
   it('changing the delay select writes editorAutoSaveDelayMs and is disabled while off', async () => {
     renderPage()
+    goTo('Editor')
 
     const select = await screen.findByLabelText('Auto save delay')
     expect(select).toBeDisabled()
+    expect(screen.getByText('Turn on auto save to choose a delay.')).toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('switch', { name: 'Enable auto save' }))
+    fireEvent.click(screen.getByRole('switch', { name: 'Auto save' }))
     await waitFor(() => {
       expect(screen.getByLabelText('Auto save delay')).toBeEnabled()
     })
@@ -177,6 +230,27 @@ describe('AppPreferences editor auto-save controls (GH-539)', () => {
     fireEvent.change(screen.getByLabelText('Auto save delay'), { target: { value: '2000' } })
     await waitFor(() => {
       expect(useAppSettingsStore.getState().settings.editorAutoSaveDelayMs).toBe(2000)
+    })
+  })
+})
+
+describe('AppPreferences idle chat window', () => {
+  beforeEach(() => {
+    tauriRef.current = true
+    vi.clearAllMocks()
+    useAppSettingsStore.setState({ settings: { ...DEFAULT_APP_SETTINGS }, isLoaded: true })
+  })
+
+  it('saves Keep idle chats and pushes the window to the host', async () => {
+    renderPage()
+    goTo('Agent chats')
+    fireEvent.change(await screen.findByLabelText('Close idle chats after'), {
+      target: { value: '7200' }
+    })
+
+    await waitFor(() => {
+      expect(useAppSettingsStore.getState().settings.agentIdleWindowSecs).toBe(7200)
+      expect(acpApi.setAgentIdleWindow).toHaveBeenCalledWith(7200)
     })
   })
 })
@@ -190,7 +264,7 @@ describe('AppPreferences notification switches (issue #865)', () => {
 
   it('renders the three notification switches and writes each setting', async () => {
     renderPage()
-
+    goTo('Notifications')
     const terminal = await screen.findByRole('switch', {
       name: 'Notify when a terminal agent finishes'
     })
@@ -231,64 +305,77 @@ describe('AppPreferences web honesty gates (Story 8)', () => {
     renderPage()
   }
 
-  it('hides the whole Updates control set on web and shows the server version note', async () => {
+  it('hides the whole Updates page on web and shows the server version on Logs', async () => {
     renderWeb()
 
-    expect(screen.queryByRole('button', { name: /Check for Updates/ })).not.toBeInTheDocument()
-    expect(screen.queryByText('Release Channel')).not.toBeInTheDocument()
-    expect(screen.queryByText('Auto-update')).not.toBeInTheDocument()
-    expect(await screen.findByText(/Server Version/i, { selector: 'label' })).toBeInTheDocument()
+    const nav = screen.getByRole('navigation', { name: 'Settings pages' })
+    expect(within(nav).queryByRole('button', { name: 'Updates' })).not.toBeInTheDocument()
+    expect(screen.queryByText(/Check for updates/i)).not.toBeInTheDocument()
+    expect(screen.queryByText('Release channel')).not.toBeInTheDocument()
+
+    goTo('Logs')
+    expect(await screen.findByRole('heading', { name: 'Server version' })).toBeInTheDocument()
     expect(
       screen.getByText(/web client is served by the termul-server and updates together with it/i)
     ).toBeInTheDocument()
   })
 
-  it('hides Reveal Log Folder / Export Log File / Export to Default on web', async () => {
+  it('hides the log folder and file exports on web', async () => {
     renderWeb()
+    goTo('Logs')
 
-    await screen.findByRole('button', { name: /Copy Log Contents/ })
-    expect(screen.queryByRole('button', { name: /Reveal Log Folder/ })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /Export Log File\.\.\./ })).not.toBeInTheDocument()
+    await screen.findByRole('button', { name: 'Copy log contents' })
+    expect(screen.queryByRole('button', { name: 'Show log folder' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Export log file…' })).not.toBeInTheDocument()
     expect(
-      screen.queryByRole('button', { name: /Export to Default Directory/ })
+      screen.queryByRole('button', { name: 'Export log to Downloads' })
     ).not.toBeInTheDocument()
   })
 
-  it('replaces the ACP timeout selects with a read-only managed note on web', async () => {
+  it('keeps Close idle chats after editable on web and leaves the other timeouts read-only', async () => {
     renderWeb()
+    goTo('Agent chats')
+    expect(await screen.findByText('Set on the server.')).toBeInTheDocument()
+    const keep = screen.getByLabelText('Close idle chats after')
+    expect(keep).toBeEnabled()
+    expect(screen.queryByLabelText('If an answer goes quiet')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Longest one answer')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Start a new chat')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('Open a saved chat')).not.toBeInTheDocument()
 
-    expect(
-      await screen.findByText(/Managed by the server — timeouts for agents spawned/i)
-    ).toBeInTheDocument()
-    expect(screen.queryByLabelText(/Turn Timeout \(hard cap\)/)).not.toBeInTheDocument()
-    expect(screen.queryByLabelText('Turn Idle Timeout')).not.toBeInTheDocument()
-    expect(screen.queryByLabelText('Session/New Timeout')).not.toBeInTheDocument()
-    expect(screen.queryByLabelText('Session Reopen Timeout')).not.toBeInTheDocument()
+    fireEvent.change(keep, { target: { value: '7200' } })
+    await waitFor(() => {
+      expect(useAppSettingsStore.getState().settings.agentIdleWindowSecs).toBe(7200)
+      expect(acpApi.setAgentIdleWindow).toHaveBeenCalledWith(7200)
+    })
   })
 
   it('hides the New Browser Tab shortcut row on web but keeps other shortcuts', async () => {
     renderWeb()
-
+    goTo('Keyboard shortcuts')
     await screen.findByText('Command Palette')
     expect(screen.queryByText('New Browser Tab')).not.toBeInTheDocument()
     expect(screen.getByText('Agent Launcher')).toBeInTheDocument()
   })
 
-  it('keeps Copy Log Contents enabled on web (works in the browser)', async () => {
+  it('keeps Copy log enabled on web (works in the browser)', async () => {
     renderWeb()
+    goTo('Logs')
 
-    const copy = await screen.findByRole('button', { name: /Copy Log Contents/ })
+    const copy = await screen.findByRole('button', { name: 'Copy log contents' })
     expect(copy).toBeEnabled()
   })
 
   it('offers the update controls ungated on desktop', async () => {
     renderPage()
+    goTo('Updates')
 
-    const check = await screen.findByRole('button', { name: /Check for Updates/ })
+    const check = await screen.findByRole('button', { name: /Check for updates/ })
     expect(check).toBeEnabled()
     expect(check).not.toHaveAttribute('title')
 
-    const reveal = screen.getByRole('button', { name: /Reveal Log Folder/ })
+    goTo('Logs')
+    const reveal = screen.getByRole('button', { name: 'Show log folder' })
     expect(reveal).toBeEnabled()
     expect(reveal).not.toHaveAttribute('title')
   })
@@ -308,6 +395,7 @@ describe.each([
   })
 
   async function findSwitch(): Promise<HTMLElement> {
+    goTo('Appearance')
     return screen.findByRole('switch', { name: 'Screen reader mode' })
   }
 
@@ -326,13 +414,12 @@ describe.each([
     expect(description).toHaveTextContent(/repeat typed characters/i)
   })
 
-  it('sits after the Terminal Renderer control and before Preview', async () => {
+  it('sits after the Renderer control and before Preview', async () => {
     renderPage()
 
     const toggle = await findSwitch()
-    const rendererLabel = screen.getByText('Terminal Renderer', { selector: 'label' })
-    const renderer = within(rendererLabel.parentElement as HTMLElement).getByRole('combobox')
-    const preview = screen.getByText('Preview', { selector: 'label' })
+    const renderer = screen.getByLabelText('Renderer')
+    const preview = screen.getByRole('heading', { name: 'Preview' })
 
     expect(renderer.compareDocumentPosition(toggle) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(toggle.compareDocumentPosition(preview) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
@@ -416,8 +503,9 @@ describe.each([
     const toggle = await findSwitch()
     expect(toggle).toHaveAttribute('aria-checked', 'true')
 
-    fireEvent.click(screen.getByRole('button', { name: /Reset to Defaults/ }))
-    fireEvent.click(await screen.findByRole('button', { name: 'Reset' }))
+    goTo('Reset')
+    fireEvent.click(screen.getByRole('button', { name: 'Reset settings…' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Reset settings' }))
 
     await waitFor(() => {
       expect(useAppSettingsStore.getState().settings.terminalScreenReaderMode).toBe(false)

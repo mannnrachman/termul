@@ -312,6 +312,7 @@ vi.mock('@/stores/acp-store', () => ({
 }))
 const { gitState } = vi.hoisted(() => ({
   gitState: {
+    errors: {},
     statuses: {} as Record<string, unknown[]>,
     diffs: {},
     selectedFile: null,
@@ -669,6 +670,7 @@ describe('WorkspaceLayout mobile branch', () => {
         'Files',
         'Command palette',
         'Project settings',
+        'Report a bug',
         'Close terminal'
       ])
     })

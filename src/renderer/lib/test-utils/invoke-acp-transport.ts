@@ -159,8 +159,13 @@ export function createInvokeAcpTransport(): AcpTransport {
     setTurnIdleTimeout: (secs) => invoke<void>('acp_set_turn_idle_timeout', { secs }),
     setSessionNewTimeout: (secs) => invoke<void>('acp_set_session_new_timeout', { secs }),
     setSessionReopenTimeout: (secs) => invoke<void>('acp_set_session_reopen_timeout', { secs }),
-    fetchRegistrySnapshot: (forceRefresh = false) =>
-      invoke<AcpRegistrySnapshot>('acp_fetch_registry_snapshot', { forceRefresh }),
+    setAgentIdleWindow: (secs) => invoke<void>('acp_set_agent_idle_window', { secs }),
+    getAgentIdleWindow: () =>
+      invoke<{ secs: number; source: 'default' | 'setting' | 'env' | 'operator' }>(
+        'acp_get_agent_idle_window'
+      ),
+    fetchRegistrySnapshot: () =>
+      invoke<AcpRegistrySnapshot>('acp_fetch_registry_snapshot', { forceRefresh: true }),
     probeMcpServer: (server) => invoke<ProbeResult>('acp_probe_mcp_server', { server }),
     listClaudeAccounts: () => invoke<ClaudeAccountsSnapshot>('claude_accounts_list'),
     listClaudeUsage: (force = false) =>
@@ -209,7 +214,8 @@ export function createInvokeAcpTransport(): AcpTransport {
           agentId,
           sessionId,
           cwd,
-          ...(additionalDirectories?.length ? { additionalDirectories } : {})
+          ...(additionalDirectories?.length ? { additionalDirectories } : {}),
+          ...(options?.mcpServers ? { mcpServers: options.mcpServers } : {})
         },
         options
       ),
@@ -220,7 +226,8 @@ export function createInvokeAcpTransport(): AcpTransport {
           agentId,
           sessionId,
           cwd,
-          ...(additionalDirectories?.length ? { additionalDirectories } : {})
+          ...(additionalDirectories?.length ? { additionalDirectories } : {}),
+          ...(options?.mcpServers ? { mcpServers: options.mcpServers } : {})
         },
         options
       ),

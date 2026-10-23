@@ -27,7 +27,12 @@ export const useAppSettingsStore = create<AppSettingsState>((set) => ({
       settings: { ...state.settings, ...updates }
     })),
 
-  resetToDefaults: () => set({ settings: DEFAULT_APP_SETTINGS })
+  // Terminal profiles are the user's own launch entries, not preferences: a
+  // reset keeps them, as it keeps MCP servers and custom agents.
+  resetToDefaults: () =>
+    set((state) => ({
+      settings: { ...DEFAULT_APP_SETTINGS, terminalProfiles: state.settings.terminalProfiles }
+    }))
 }))
 
 // Selectors
@@ -65,6 +70,8 @@ export const useAcpSessionNewTimeout = () =>
   useAppSettingsStore((state) => state.settings.acpSessionNewTimeoutSecs)
 export const useAcpSessionReopenTimeout = () =>
   useAppSettingsStore((state) => state.settings.acpSessionReopenTimeoutSecs)
+export const useAgentIdleWindow = () =>
+  useAppSettingsStore((state) => state.settings.agentIdleWindowSecs)
 export const useNotifyOnTerminalIdle = () =>
   useAppSettingsStore((state) => state.settings.notifyOnTerminalIdle)
 export const useNotifyOnAgentChatTurnFinished = () =>

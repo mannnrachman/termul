@@ -8,10 +8,12 @@ import {
 import { useMobileAttentionCount } from '@/hooks/use-mobile-attention-count'
 import { sectionForTab } from '@/hooks/use-mobile-section'
 import { useMobileTabActions } from '@/hooks/use-mobile-tab-actions'
+import { useReloadChat } from '@/hooks/use-reload-chat'
 import { useShellAnnouncements } from '@/hooks/use-shell-announcements'
 import { closeAgentChat } from '@/lib/agent-chat-close'
-import { returnFocusAfterConfirm } from '@/lib/confirm-focus-return'
+import { returnFocusAfterConfirm, returnFocusAfterModal } from '@/lib/confirm-focus-return'
 import { commitDiffTabLabel } from '@/lib/diff-tab-identity'
+import { basename } from '@/lib/path-basename'
 import {
   holdSheetReturnTargets,
   recordSheetOpener,
@@ -34,8 +36,6 @@ import { MobileShellDrawer } from './MobileShellDrawer'
 import { MobileShellHeader } from './MobileShellHeader'
 import { MobileTerminalActionsSheet } from './MobileTerminalActionsSheet'
 import { MobileTerminalControls } from './MobileTerminalControls'
-
-const fileBasename = (path: string): string => path.split(/[\\/]/).pop() || path
 
 /** A browser tab's name: its title, else its host, else "Browser" (as `WorkspaceTabBar`). */
 function browserTabLabel(tab: { title: string; url: string } | undefined): string {
@@ -82,6 +82,8 @@ interface MobileChatShellProps {
   onRestartTerminal?: (terminalId: string) => void
   /** Opens Project settings (header ⋯ sheet). */
   onOpenProjectSettings?: () => void
+  /** Opens the Report a Bug dialog (both ⋯ sheets; spec-bug-report-dialog). */
+  onReportBug?: () => void
   /** Opens the command history modal (terminal ⋯ sheet). */
   onOpenCommandHistory?: () => void
   /**
@@ -116,6 +118,7 @@ export function MobileChatShell({
   onOpenGitChanges,
   onRestartTerminal,
   onOpenProjectSettings,
+  onReportBug,
   onOpenCommandHistory,
   onNewProject,
   onOpenGitHistory,
@@ -220,19 +223,19 @@ export function MobileChatShell({
       case 'agent-chat':
         return sessionTitle ?? 'Agent Chat'
       case 'editor':
-        return fileBasename(activeTab.filePath)
+        return basename(activeTab.filePath)
       case 'git':
         return 'Git Changes'
       case 'git-history':
         return 'Git History'
       case 'diff':
-        return fileBasename(activeTab.path)
+        return basename(activeTab.path)
       case 'commit-diff':
         return commitDiffTabLabel(activeTab.path, activeTab.commit)
       case 'browser':
         return browserTabLabel(activeBrowserTab)
       case 'canvas':
-        return fileBasename(activeTab.docPath)
+        return basename(activeTab.docPath)
       default:
         reportUnknownTabKind(activeTab, 'MobileChatShell.headerTitle', 'using default title')
         return 'Termul'
@@ -323,16 +326,16 @@ export function MobileChatShell({
   // the close raised a confirm (a dirty editor) the sheet hands off to it, as
   // the drawer does: no focus return now, the opener once the confirm is gone.
   const skipMoreSheetFocusRef = useRef(false)
-  const cancelConfirmFocusRef = useRef<(() => void) | null>(null)
-  useEffect(() => () => cancelConfirmFocusRef.current?.(), [])
+  const cancelHandoffFocusRef = useRef<(() => void) | null>(null)
+  useEffect(() => () => cancelHandoffFocusRef.current?.(), [])
   const closeActiveOtherTab =
     activeTab && activeTab.type !== 'agent-chat' && activeTab.type !== 'terminal'
       ? (): void => {
           if (!closePaneTab(activeTab)) return
           const restoreFocus = holdSheetReturnTargets('header-more-sheet')
           skipMoreSheetFocusRef.current = true
-          cancelConfirmFocusRef.current?.()
-          cancelConfirmFocusRef.current = returnFocusAfterConfirm(restoreFocus)
+          cancelHandoffFocusRef.current?.()
+          cancelHandoffFocusRef.current = returnFocusAfterConfirm(restoreFocus)
         }
       : undefined
   const onMoreSheetCloseAutoFocus = (event: Event): void => {
@@ -345,6 +348,7 @@ export function MobileChatShell({
   }
 
   // Header ⋯ "Close chat": the same teardown the drawer's Recents rows use.
+  const chatReload = useReloadChat(activeTab?.type === 'agent-chat' ? activeTab.sessionId : null)
   const closeActiveChat = (): void => {
     if (activeTab?.type !== 'agent-chat') return
     const tabId = activeTab.id
@@ -371,6 +375,18 @@ export function MobileChatShell({
     : undefined
   const openCommandPalette = !isTauriContext() ? onOpenCommandPalette : undefined
   const openProjectSettings = activeProject ? onOpenProjectSettings : undefined
+  // Project settings and New project hand a sheet over to a modal. The sheet's
+  // close consumes its recorded opener, so read it here and put focus back on
+  // it once the modal is gone.
+  const handOffToModal = (sheetId: string, open: (() => void) | undefined) =>
+    open
+      ? (): void => {
+          const restoreFocus = holdSheetReturnTargets(sheetId)
+          cancelHandoffFocusRef.current?.()
+          cancelHandoffFocusRef.current = returnFocusAfterModal(restoreFocus)
+          open()
+        }
+      : undefined
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background" data-mobile-chat-shell="">
@@ -448,8 +464,8 @@ export function MobileChatShell({
         <ProjectSwitcherDrawer
           open={projectsOpen}
           onOpenChange={setProjectsOpen}
-          onAddProject={onNewProject}
-          onOpenProjectSettings={openProjectSettings}
+          onAddProject={handOffToModal('projects-sheet', onNewProject)}
+          onOpenProjectSettings={handOffToModal('projects-sheet', openProjectSettings)}
           side="bottom"
           id="mobile-project-sheet"
           onCloseAutoFocus={projectSheetCloseAutoFocus}
@@ -478,8 +494,12 @@ export function MobileChatShell({
         onOpenFiles={openFilesFromSheet}
         onOpenCommandPalette={openCommandPalette}
         onNewTerminal={newTerminal}
-        onOpenProjectSettings={openProjectSettings}
+        onOpenProjectSettings={handOffToModal('header-more-sheet', openProjectSettings)}
+        onReportBug={handOffToModal('header-more-sheet', onReportBug)}
         onCloseChat={activeTab?.type === 'agent-chat' ? closeActiveChat : undefined}
+        onReloadChat={activeTab?.type === 'agent-chat' ? chatReload.reload : undefined}
+        reloadChatDisabled={chatReload.disabled}
+        reloadChatReason={chatReload.reason}
         onCloseTab={closeActiveOtherTab}
       />
 
@@ -499,7 +519,8 @@ export function MobileChatShell({
           onOpenGitChanges={openGitChangesFromSheet}
           onOpenFiles={openFilesFromSheet}
           onOpenCommandPalette={openCommandPalette}
-          onOpenProjectSettings={openProjectSettings}
+          onOpenProjectSettings={handOffToModal('terminal-actions-sheet', openProjectSettings)}
+          onReportBug={handOffToModal('terminal-actions-sheet', onReportBug)}
           onCloseTerminal={onCloseTerminal}
         />
       )}

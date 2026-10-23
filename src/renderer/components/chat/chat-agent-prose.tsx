@@ -1,9 +1,10 @@
 import { mermaid as mermaidPlugin } from '@streamdown/mermaid'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   type AllowedTags,
   type Components,
+  defaultComponents,
   defaultRemarkPlugins,
   type LinkSafetyConfig,
   type LinkSafetyModalProps,
@@ -26,6 +27,9 @@ import { readAttachmentBytes } from '@/lib/attachment-api'
 import { type FilePathResolutionContext, openFilePathFromTerminal } from '@/lib/file-path-links'
 import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
+import { syntaxShikiPair } from '@/lib/themes/syntax-shiki'
+import { cn } from '@/lib/utils'
+import { useColorTheme } from '@/stores/app-settings-store'
 import { TermulPlanRenderer } from './ChatMarkdownPlanFence'
 import { guessMimeType, uint8ToBase64 } from './chat-attachments'
 import { chatCodePlugin } from './chat-code-plugin'
@@ -33,6 +37,7 @@ import { ChatMarkdownCode } from './chat-markdown-code'
 import { remarkFilePathLinks } from './chat-markdown-file-links'
 import { remarkTermulImages, resolveLocalImagePath } from './chat-markdown-images'
 import { ChatMarkdownTable } from './chat-markdown-table'
+import { ChatMarkdownSpan } from './chat-markdown-word'
 
 /** Always-on remark plugins: streamdown defaults plus the termul-image rewrite. */
 const IMAGE_REMARK_PLUGINS = [...Object.values(defaultRemarkPlugins), remarkTermulImages]
@@ -54,8 +59,8 @@ const STREAMDOWN_ALLOWED_TAGS: AllowedTags = {
 }
 
 /**
- * Shiki syntax-highlighting for fenced code blocks. Themes track the app's
- * light/dark mode via Streamdown's dual-theme output (github-light/dark).
+ * Shiki syntax-highlighting for fenced code blocks. The theme pair matches
+ * the active color theme (light twin, then dark twin).
  */
 const CODE_PLUGIN = chatCodePlugin
 /** Live Mermaid diagram rendering for ```mermaid fences. */
@@ -84,6 +89,7 @@ const STREAMDOWN_CONTROLS = {
 
 const STREAMDOWN_COMPONENTS = {
   code: ChatMarkdownCode,
+  span: ChatMarkdownSpan,
   table: ChatMarkdownTable
 } as const
 
@@ -96,7 +102,7 @@ const STREAMDOWN_ANIMATED = {
   duration: 350,
   easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
   sep: 'word',
-  stagger: 60
+  stagger: 12
 } as const
 
 /**
@@ -144,6 +150,33 @@ const LINK_SAFETY: LinkSafetyConfig = {
   // Always take the confirm path; never open from the check callback.
   onLinkCheck: () => false,
   renderModal: (props) => <StreamdownLinkSafetyModal {...props} />
+}
+
+const StreamdownLink = defaultComponents.a
+const LINK_CLASS = 'wrap-anywhere font-medium text-primary underline'
+
+function decodeFragment(href: string): string {
+  try {
+    return decodeURIComponent(href.slice(1))
+  } catch {
+    return href.slice(1)
+  }
+}
+
+function scrollToFragment(messageRoot: HTMLElement | null, href: string): void {
+  const id = decodeFragment(href)
+  const target = id
+    ? Array.from(messageRoot?.querySelectorAll('[id]') ?? []).find((element) => element.id === id)
+    : undefined
+  if (!target) {
+    void logFrontendError({
+      level: 'info',
+      source: 'ChatMessage.anchorLink',
+      message: `No element with id '${id}' in this message; ignoring '${href}'`
+    })
+    return
+  }
+  target.scrollIntoView({ block: 'start' })
 }
 
 /** Muted fallback for images we cannot render (web without Tauri, unreadable). */
@@ -308,7 +341,10 @@ export function AgentProse({
   // Streamdown commits at 10 Hz trailing-edge while streaming; the turn-end
   // render commits the exact final text immediately.
   const text = useThrottledStreamingText(rawText, streaming)
+  const colorTheme = useColorTheme()
+  const shikiTheme = useMemo(() => syntaxShikiPair(colorTheme), [colorTheme])
   const [externalUrl, setExternalUrl] = useState<string | null>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
   const components = useMemo<Components>(() => {
     const merged: Components = {
       ...STREAMDOWN_COMPONENTS,
@@ -316,27 +352,58 @@ export function AgentProse({
         const url = typeof props['data-url'] === 'string' ? props['data-url'] : ''
         const alt = typeof props['data-alt'] === 'string' ? props['data-alt'] : ''
         return <TermulMarkdownImage url={url} alt={alt} cwd={filePathContext?.cwd} />
+      },
+      a: ({ href, children, node, className, ...props }) => {
+        if (href?.startsWith('#')) {
+          const { target: _target, rel: _rel, ...anchorProps } = props
+          return (
+            <a
+              href={href}
+              {...anchorProps}
+              className={cn(LINK_CLASS, className)}
+              data-streamdown="link"
+              onClick={(event) => {
+                event.preventDefault()
+                scrollToFragment(rootRef.current, href)
+              }}
+              onAuxClick={(event) => {
+                event.preventDefault()
+              }}
+            >
+              {children}
+            </a>
+          )
+        }
+        if (!filePathContext) {
+          return (
+            <StreamdownLink href={href} node={node} className={className} {...props}>
+              {children}
+            </StreamdownLink>
+          )
+        }
+        return (
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            {...props}
+            className={cn(LINK_CLASS, className)}
+            data-streamdown="link"
+            onClick={(event) => {
+              event.preventDefault()
+              if (href) setExternalUrl(href)
+            }}
+            onAuxClick={(event) => {
+              event.preventDefault()
+            }}
+          >
+            {children}
+          </a>
+        )
       }
     }
     if (filePathContext) {
       const context = filePathContext
-      merged.a = ({ href, children, ...props }) => (
-        <a
-          href={href}
-          target="_blank"
-          rel="noreferrer"
-          {...props}
-          onClick={(event) => {
-            event.preventDefault()
-            if (href) setExternalUrl(href)
-          }}
-          onAuxClick={(event) => {
-            event.preventDefault()
-          }}
-        >
-          {children}
-        </a>
-      )
       merged['termul-file-path'] = (props: Record<string, unknown>) => {
         const path = typeof props['data-path'] === 'string' ? props['data-path'] : ''
         return (
@@ -350,7 +417,7 @@ export function AgentProse({
   }, [filePathContext])
 
   return (
-    <div className="chat-streamdown min-w-0 text-sm leading-normal text-foreground">
+    <div ref={rootRef} className="chat-streamdown min-w-0 text-sm leading-normal text-foreground">
       <Streamdown
         mode={streaming ? 'streaming' : 'static'}
         isAnimating={streaming}
@@ -368,7 +435,7 @@ export function AgentProse({
         components={components}
         lineNumbers={false}
         linkSafety={LINK_SAFETY}
-        shikiTheme={['github-light', 'github-dark']}
+        shikiTheme={shikiTheme}
       >
         {text}
       </Streamdown>

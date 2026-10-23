@@ -24,7 +24,7 @@ export interface ToolCallSummary {
   diffStat?: { added: number; removed: number } | null
 }
 
-function asRecord(value: unknown): Record<string, unknown> | null {
+export function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? (value as Record<string, unknown>) : null
 }
 
@@ -227,6 +227,25 @@ export function isToolCallRunning(toolCall: ToolCall): boolean {
   return toolCall.status === 'pending' || toolCall.status === 'in_progress'
 }
 
+/**
+ * A subagent dispatch runs while its parent turn is active: it is
+ * pending/in_progress, has no status yet (the adapter sends the dispatch
+ * before any status update), or is a background agent whose launch call has
+ * completed but whose agent has not ended. A cancelled or crashed turn can
+ * leave a dispatch pending forever, so an ended turn never counts that as
+ * running. A host lifecycle of `running` is different: the host reports the
+ * real end later, and the subagent can outlive the turn. A known terminal
+ * agent state always wins over the tool-call status.
+ */
+export function isSubagentRunning(toolCall: ToolCall, parentTurnActive: boolean): boolean {
+  const lifecycle = toolCall.subagentLifecycle
+  if (lifecycle?.state !== undefined && lifecycle.state !== 'running') return false
+  if (toolCall.status === 'failed') return false
+  if (lifecycle?.state === 'running') return true
+  if (!parentTurnActive) return false
+  return isToolCallRunning(toolCall) || toolCall.status == null || lifecycle?.background === true
+}
+
 function runningVerbForKind(kind: ToolKind | undefined): string {
   switch (kind) {
     case 'read':
@@ -361,4 +380,182 @@ export function describeToolCall(toolCall: ToolCall): ToolCallSummary {
       return { verb, primary: title ?? toolCall.kind ?? 'Tool call', detail: null }
     }
   }
+}
+
+type ActivityCategory =
+  | 'command'
+  | 'file-read'
+  | 'file-created'
+  | 'file-edited'
+  | 'file-deleted'
+  | 'file-moved'
+  | 'search'
+  | 'fetch'
+  | 'agent'
+  | 'background-agent'
+  | 'agent-control'
+  | 'mode'
+  | 'other'
+
+/** `rawInput` flags of a subagent dispatch that asks for a background launch. */
+export const BACKGROUND_INPUT_KEYS = ['run_in_background', 'is_background', 'background']
+
+function isBackgroundAgent(call: ToolCall): boolean {
+  if (call.subagentLifecycle?.background === true) return true
+  const input = asRecord(call.rawInput)
+  if (!input) return false
+  return BACKGROUND_INPUT_KEYS.some((key) => input[key] === true)
+}
+
+/** A Codex collaboration tool call (`spawnAgent`, `wait`, `sendInput`, ...). */
+export function isCodexCollabCall(call: ToolCall): boolean {
+  const input = asRecord(call.rawInput)
+  return !!input && ('senderThreadId' in input || 'agentsStates' in input)
+}
+
+export function isCodexSpawnCall(call: ToolCall): boolean {
+  return (
+    isCodexCollabCall(call) &&
+    (call.title ?? '').replace(/[_\s-]/g, '').toLowerCase() === 'spawnagent'
+  )
+}
+
+/** A Codex subagent activity card (`Start subagent <name>`, ...). */
+export function codexActivity(call: ToolCall): { threadId: string; kind: string } | null {
+  const input = asRecord(call.rawInput)
+  const threadId = firstString(input, ['agentThreadId'])
+  const kind = firstString(input, ['activityKind'])
+  return threadId && kind ? { threadId, kind } : null
+}
+
+/** Thread ids a Codex collab call names: receivers plus `agentsStates` keys. */
+export function codexThreadIds(call: ToolCall): string[] {
+  const input = asRecord(call.rawInput)
+  if (!input) return []
+  const ids = new Set<string>()
+  if (Array.isArray(input.receiverThreadIds)) {
+    for (const id of input.receiverThreadIds) if (typeof id === 'string' && id) ids.add(id)
+  }
+  for (const id of Object.keys(asRecord(input.agentsStates) ?? {})) ids.add(id)
+  return [...ids]
+}
+
+/**
+ * A call that controls an existing subagent instead of starting one: a Codex
+ * collab call other than `spawnAgent` (`wait`, `sendInput`, `closeAgent`, ...),
+ * or a Codex activity card (`Start subagent <name>`, ...), which reports an
+ * agent that its spawn call already represents.
+ */
+export function isSubagentControlCall(call: ToolCall): boolean {
+  if (codexActivity(call)) return true
+  return isCodexCollabCall(call) && !isCodexSpawnCall(call)
+}
+
+/**
+ * Create-only edit: at least one diff item, and every diff created its file
+ * (`oldText == null`). A mixed create+edit call, or a restored call with no
+ * diff content at all, counts as an edit.
+ */
+function isFileCreation(call: ToolCall): boolean {
+  const diffs = (call.content ?? []).filter((item) => item.type === 'diff')
+  return (
+    diffs.length > 0 && diffs.every((item) => (item as { oldText?: string | null }).oldText == null)
+  )
+}
+
+/**
+ * First-match-wins classification. Subagent checks lead because ACP gives
+ * dispatches no dedicated kind — they arrive looking like `think`/`other`.
+ */
+const ACTIVITY_CATEGORY_RULES: ReadonlyArray<{
+  category: ActivityCategory
+  match: (call: ToolCall) => boolean
+}> = [
+  { category: 'agent-control', match: (call) => isSubagentControlCall(call) },
+  {
+    category: 'background-agent',
+    match: (call) => isSubagentCall(call) && isBackgroundAgent(call)
+  },
+  { category: 'agent', match: (call) => isSubagentCall(call) },
+  { category: 'command', match: (call) => call.kind === 'execute' },
+  { category: 'file-read', match: (call) => call.kind === 'read' },
+  { category: 'file-created', match: (call) => call.kind === 'edit' && isFileCreation(call) },
+  { category: 'file-edited', match: (call) => call.kind === 'edit' },
+  { category: 'file-deleted', match: (call) => call.kind === 'delete' },
+  { category: 'file-moved', match: (call) => call.kind === 'move' },
+  { category: 'search', match: (call) => call.kind === 'search' },
+  { category: 'fetch', match: (call) => call.kind === 'fetch' },
+  { category: 'mode', match: (call) => call.kind === 'switch_mode' }
+]
+
+const ACTIVITY_PHRASES: Record<ActivityCategory, { one: string; many: (n: number) => string }> = {
+  command: { one: 'ran 1 command', many: (n) => `ran ${n} commands` },
+  'file-read': { one: 'read 1 file', many: (n) => `read ${n} files` },
+  'file-created': { one: 'created 1 file', many: (n) => `created ${n} files` },
+  'file-edited': { one: 'edited 1 file', many: (n) => `edited ${n} files` },
+  'file-deleted': { one: 'deleted 1 file', many: (n) => `deleted ${n} files` },
+  'file-moved': { one: 'moved 1 file', many: (n) => `moved ${n} files` },
+  search: { one: 'ran 1 search', many: (n) => `ran ${n} searches` },
+  fetch: { one: 'fetched 1 page', many: (n) => `fetched ${n} pages` },
+  agent: { one: 'ran 1 agent', many: (n) => `ran ${n} agents` },
+  'background-agent': {
+    one: 'ran 1 background agent',
+    many: (n) => `ran ${n} background agents`
+  },
+  'agent-control': {
+    one: 'sent 1 agent command',
+    many: (n) => `sent ${n} agent commands`
+  },
+  mode: { one: 'switched mode', many: (n) => `switched mode ${n} times` },
+  other: { one: 'used 1 tool', many: (n) => `used ${n} tools` }
+}
+
+const THOUGHT_PHRASE = { one: 'thought', many: (n: number) => `thought ${n} times` }
+
+/** `.t-think-text` is `nowrap`, so the phrase count is the label's length bound. */
+const MAX_ACTIVITY_PHRASES = 4
+
+export interface ToolActivitySummary {
+  label: string
+  added: number
+  removed: number
+}
+
+/**
+ * Roll tool calls into one categorized line for a collapsed activity
+ * disclosure — "Ran 2 commands, created 1 file" — plus the summed diff
+ * counts. A `thoughts` count leads the line: "Thought 3 times, ran 2
+ * commands". Phrases appear in first-occurrence order; past the cap the label
+ * tails off as "and N more", where N counts the unshown CALLS. Null when there
+ * are neither calls nor thoughts.
+ */
+export function summarizeToolActivity(
+  calls: ToolCall[],
+  { thoughts = 0 }: { thoughts?: number } = {}
+): ToolActivitySummary | null {
+  if (calls.length === 0 && thoughts === 0) return null
+  const counts = new Map<ActivityCategory, number>()
+  let added = 0
+  let removed = 0
+  for (const call of calls) {
+    const category = ACTIVITY_CATEGORY_RULES.find((rule) => rule.match(call))?.category ?? 'other'
+    counts.set(category, (counts.get(category) ?? 0) + 1)
+    const diffStat = describeToolCall(call).diffStat
+    if (diffStat) {
+      added += diffStat.added
+      removed += diffStat.removed
+    }
+  }
+  const entries = [...counts].map(([category, count]) => ({
+    phrase: ACTIVITY_PHRASES[category],
+    count
+  }))
+  if (thoughts > 0) entries.unshift({ phrase: THOUGHT_PHRASE, count: thoughts })
+  const phrases = entries
+    .slice(0, MAX_ACTIVITY_PHRASES)
+    .map(({ phrase, count }) => (count === 1 ? phrase.one : phrase.many(count)))
+  const hiddenCalls = entries.slice(MAX_ACTIVITY_PHRASES).reduce((sum, { count }) => sum + count, 0)
+  let label = phrases.join(', ')
+  if (hiddenCalls > 0) label += `, and ${hiddenCalls} more`
+  return { label: label.charAt(0).toUpperCase() + label.slice(1), added, removed }
 }

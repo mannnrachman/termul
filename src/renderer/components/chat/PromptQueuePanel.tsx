@@ -94,20 +94,21 @@ export function PromptQueuePanel({
   if (items.length === 0) return null
 
   return (
-    <Queue className="-mb-6">
+    <Queue className="mb-2">
       <QueueSection open={open} onOpenChange={setOpen}>
         {/* Match the Changed files toggle: no press-scale, background-only press. */}
         <QueueSectionTrigger
           data-press-feedback="off"
           className={cn(
             'select-none text-xs hover:bg-secondary/60 hover:text-foreground active:bg-secondary/80',
+            'focus-visible:bg-secondary/60 focus-visible:outline-hidden forced-colors:focus-visible:-outline-offset-2 focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
             isMobileShell && 'min-h-11'
           )}
         >
           <QueueSectionLabel count={items.length} label="Queued" className="tabular-nums" />
         </QueueSectionTrigger>
         <QueueSectionContent forceMount>
-          <CollapseExpandMotion open={open} motion="chat">
+          <CollapseExpandMotion open={open}>
             <QueueList>
               {items.map((item) => {
                 // Preview the display (token) blocks so the queue reads as the

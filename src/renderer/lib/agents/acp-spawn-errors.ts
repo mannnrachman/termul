@@ -1,4 +1,8 @@
-import { isProviderErrorCode, type ProviderErrorCode } from '@shared/types/web-protocol.types'
+import {
+  isProviderErrorCode,
+  type ProviderErrorCode,
+  WS_ERROR_CODES
+} from '@shared/types/web-protocol.types'
 import type { AgentConfig, AuthMethod } from '@/lib/acp-api'
 import { DEFINITE_SPAWN_REJECTIONS } from '@/lib/acp-transport/tauri-verdicts'
 
@@ -8,6 +12,41 @@ import { DEFINITE_SPAWN_REJECTIONS } from '@/lib/acp-transport/tauri-verdicts'
 // error (and rewritten by `formatAcpSpawnError` into spawn guidance).
 const ENOENT_PATTERN =
   /enoent|no such file|program not found|command not found|spawn.*fail|failed to spawn/i
+
+// The Rust resolver's own wording (`pty/manager/resolve.rs`): `program not
+// found or not executable: <path>`, `program not found on PATH: <name>`, and
+// the `Agent program not found[ on PATH]: <name>` variants. Group 1 is the
+// file it names.
+const RESOLVER_FAILURE_PATTERN = /program not found(?: or not executable| on PATH)?: (.+)$/i
+
+/** Server/client rate-limit or HTTP/2 "slow down" (e.g. NGHTTP2_ENHANCE_YOUR_CALM). */
+const RATE_LIMIT_PATTERN =
+  /ENHANCE_YOUR_CALM|enhance[\s_-]?your[\s_-]?calm|rate[\s_-]?limit|too many requests|\b429\b/i
+
+/**
+ * Mid-turn stream / connection drops. Checked after rate-limit so
+ * `Stream closed … NGHTTP2_ENHANCE_YOUR_CALM` maps to the rate-limit copy.
+ */
+const STREAM_INTERRUPT_PATTERN =
+  /RetriableError|NGHTTP2_|destroyed|stream (?:closed|ended|destroyed|error)|broken pipe|e?pipe\b|econnreset|econnrefused|disconnected|connection (?:closed|lost|reset|refused|aborted)|connection.*timed out|agent thread (?:is no longer running|dropped)/i
+
+export const ACP_RATE_LIMIT_MESSAGE =
+  'Connection was rate-limited by the agent service. Wait a moment, then retry.'
+
+export const ACP_STREAM_INTERRUPT_MESSAGE =
+  'Agent connection was interrupted. Wait a moment, then retry.'
+
+/**
+ * Turn a raw agent turn/setup error into a user-facing message. Known
+ * rate-limit and stream/connection failures are rewritten into short
+ * actionable copy; everything else is passed through verbatim.
+ */
+export function formatAcpAgentError(raw: unknown): string {
+  const message = raw instanceof Error ? raw.message : String(raw)
+  if (RATE_LIMIT_PATTERN.test(message)) return ACP_RATE_LIMIT_MESSAGE
+  if (STREAM_INTERRUPT_PATTERN.test(message)) return ACP_STREAM_INTERRUPT_MESSAGE
+  return message
+}
 
 /**
  * Turn a raw spawn/setup error into a user-facing message. Only ENOENT-style
@@ -20,6 +59,38 @@ export function formatAcpSpawnError(raw: unknown, config?: Pick<AgentConfig, 'co
   // transport prefixes are not user-visible text.
   const message = definiteSpawnRejectionMessage(raw)
   if (!ENOENT_PATTERN.test(message)) return message
+
+  // npx itself can start successfully while a cached package's executable is
+  // missing (exit 127). Don't tell users to reinstall Node.js: the launcher
+  // exists, but its child command could not be resolved. In particular, a
+  // damaged ~/.npm/_npx entry can produce "sh: codex-acp: command not found".
+  // Restrict the hint to the explicit shell diagnostic and retain the raw
+  // error for other npm failures.
+  if (config?.command === 'npx' && /exit status:\s*127\b/.test(message)) {
+    const missingBin = /\bsh:\s+([^\s:'"]+): command not found\b/.exec(message)?.[1]
+    if (missingBin) {
+      return (
+        `npx started, but its package executable "${missingBin}" was not found. ` +
+        'The npx cache may be incomplete. Run `npm config get cache`, rename the `_npx` directory there as a backup, then retry.'
+      )
+    }
+  }
+
+  // Resolver-level failures name the file they could not prepare (e.g.
+  // `program not found or not executable: C:\…\npm\claude.cmd`). When that
+  // file is not the spawned command — managed `claude-acp` runs `node` while
+  // its *pre-spawn CLI probe* is the piece that failed — rewriting against
+  // `config.command` would blame the wrong binary, so the resolver's own
+  // wording stays. Any other message (an OS error such as `No such file or
+  // directory (os error 2)`) names no such file and is rewritten.
+  const namedPath = RESOLVER_FAILURE_PATTERN.exec(message)?.[1]?.trim().replace(/^"|"$/g, '')
+  if (namedPath) {
+    const namedBase = namedPath.split(/[\\/]/).filter(Boolean).pop()
+    const commandBase = config?.command?.split(/[\\/]/).pop()
+    if (namedBase && commandBase && namedBase.toLowerCase() !== commandBase.toLowerCase()) {
+      return message
+    }
+  }
 
   if (config?.command === 'npx') {
     return 'Could not run npx. Install Node.js and ensure npx is on your PATH, then try again.'
@@ -159,6 +230,28 @@ export function isAgentAuthRequiredError(raw: unknown): boolean {
 }
 
 /**
+ * The host refused because a Claude Account is not signed in: choosing it for
+ * a Project or as the default (nothing changed), or starting a managed Claude
+ * agent on it. `/ws` carries the `claude_account_signed_out` code; the desktop
+ * `invoke` path carries the same verdict as a message prefix.
+ */
+export const CLAUDE_ACCOUNT_SIGNED_OUT_PREFIX = 'ACP_CLAUDE_ACCOUNT_SIGNED_OUT'
+
+export function isClaudeAccountSignedOutError(raw: unknown): boolean {
+  if (typeof raw === 'object' && raw !== null) {
+    if ((raw as { code?: unknown }).code === WS_ERROR_CODES.CLAUDE_ACCOUNT_SIGNED_OUT) return true
+  }
+  return rawErrorMessage(raw).startsWith(`${CLAUDE_ACCOUNT_SIGNED_OUT_PREFIX}: `)
+}
+
+/** The host's sentence for a Claude sign-in refusal, without the transport tag. */
+export function claudeAccountSignedOutMessage(raw: unknown): string {
+  const message = rawErrorMessage(raw)
+  const tag = `${CLAUDE_ACCOUNT_SIGNED_OUT_PREFIX}: `
+  return message.startsWith(tag) ? message.slice(tag.length) : message
+}
+
+/**
  * The host rejected a spawn deterministically (AD-5): the agent binary is
  * missing / cannot start (`agent_unavailable`) or the config is unusable
  * (`invalid_agent_config`). `/ws` carries the stable code; the Tauri `invoke`
@@ -265,9 +358,9 @@ const TIMEOUT_PATTERN = /timed out|timeout/i
  * Transport is checked before auth (so connection/stream wording wins when both
  * are present) and before timeout (so "connection timed out" evicts rather than
  * being treated as a benign slow setup). The category is always derived from the
- * RAW error message; only the `spawn` category rewrites `detail` into friendly
- * ENOENT guidance so the user-facing text stays actionable without losing the
- * diagnostic for other categories.
+ * RAW error message; `spawn` rewrites
+ * `detail` via {@link formatAcpSpawnError}, and `transport` / `unknown` run
+ * {@link formatAcpAgentError} so rate-limit and stream drops stay actionable.
  */
 export function classifySetupError(
   raw: unknown,
@@ -293,6 +386,15 @@ export function classifySetupError(
           ? message
           : AGENT_AUTH_REQUIRED_CODE
     return { category: 'auth', label: SETUP_ERROR_LABELS.auth, detail }
+  }
+  // A signed-out Claude Account reads as sign-in guidance, as its wording
+  // always did, but without the desktop transport tag.
+  if (isClaudeAccountSignedOutError(raw)) {
+    return {
+      category: 'auth',
+      label: SETUP_ERROR_LABELS.auth,
+      detail: claudeAccountSignedOutMessage(raw)
+    }
   }
   // A definite host rejection (AD-5) is authoritative: it is a spawn failure
   // whatever the wording, and it must never read as transport/auth (those
@@ -325,7 +427,11 @@ export function classifySetupError(
     }
   }
   if (TRANSPORT_PATTERN.test(message)) {
-    return { category: 'transport', label: SETUP_ERROR_LABELS.transport, detail: message }
+    return {
+      category: 'transport',
+      label: SETUP_ERROR_LABELS.transport,
+      detail: formatAcpAgentError(raw)
+    }
   }
   if (AUTH_PATTERN.test(message)) {
     return { category: 'auth', label: SETUP_ERROR_LABELS.auth, detail: message }
@@ -333,5 +439,9 @@ export function classifySetupError(
   if (TIMEOUT_PATTERN.test(message)) {
     return { category: 'timeout', label: SETUP_ERROR_LABELS.timeout, detail: message }
   }
-  return { category: 'unknown', label: SETUP_ERROR_LABELS.unknown, detail: message }
+  return {
+    category: 'unknown',
+    label: SETUP_ERROR_LABELS.unknown,
+    detail: formatAcpAgentError(raw)
+  }
 }

@@ -182,6 +182,16 @@ vi.mock('sonner', () => ({
   toast: { error: mockToastError, success: vi.fn() }
 }))
 
+// Behavior is covered in `claude-account/ClaudeAccount.test.tsx`; here only its
+// place in the composer card matters.
+const { limitWarningRef } = vi.hoisted(() => ({ limitWarningRef: { current: false } }))
+vi.mock('@/components/chat/claude-account/ClaudeLimitWarning', () => ({
+  ClaudeLimitWarning: ({ atTop }: { atTop: boolean }) =>
+    limitWarningRef.current ? (
+      <div data-testid="claude-limit-warning-stub" data-at-top={String(atTop)} />
+    ) : null
+}))
+
 vi.mock('@/hooks/use-agent-skills', async () => {
   // Use the real (sync) buildPromptWithLoadedSkills so the wire framing is
   // exercised end-to-end — no mock needed now that paths are captured at pick
@@ -515,6 +525,47 @@ describe('ChatInputBar config controls', () => {
     expect(mockSetConfig).not.toHaveBeenCalled()
   })
 
+  it('shows a boolean Fast mode option as the one bolt toggle, not a second switch', () => {
+    const s = session()
+    const configOptions: SessionConfigOption[] = [
+      option('model', 'Model', 'model', 'opus', [
+        { value: 'opus', name: 'Opus 5.5' },
+        { value: 'sonnet', name: 'Sonnet 5.5' }
+      ]),
+      option('effort', 'Effort', 'thought_level', 'high', [
+        { value: 'low', name: 'Low' },
+        { value: 'high', name: 'High' }
+      ]),
+      { id: 'fast_mode', name: 'Fast mode', type: 'boolean', currentValue: false }
+    ]
+
+    render(
+      <TooltipProvider>
+        <ChatInputBar
+          session={s}
+          busy={false}
+          disabled={false}
+          onSend={vi.fn()}
+          onSendBlocks={vi.fn()}
+          onCancel={vi.fn()}
+          commands={[]}
+          configOptions={configOptions}
+          modes={s.modes}
+          onSetConfig={mockSetConfig}
+          onSetMode={mockSetMode}
+          onSetModel={mockSetModel}
+        />
+      </TooltipProvider>
+    )
+    fireEvent.click(screen.getByRole('button', { name: /Opus 5\.5/ }))
+
+    expect(screen.getAllByTestId('selector-fast')).toHaveLength(1)
+    expect(screen.getByTestId('selector-fast')).toBeEnabled()
+    expect(screen.queryByRole('switch', { name: 'Fast mode' })).toBeNull()
+    fireEvent.click(screen.getByTestId('selector-fast'))
+    expect(mockSetConfig).toHaveBeenCalledWith('fast_mode', true)
+  })
+
   it('searches and scroll-limits large active-chat model menus', async () => {
     const s = session()
     const configOptions = [
@@ -768,6 +819,67 @@ describe('ChatInputBar agent switch chip (Story 4, spec-in-chat-agent-switch)', 
     expect(trigger).toBeDisabled()
   })
 
+  it('disables the agent-backed controls via controlsDisabled while the editor stays enabled', async () => {
+    // A stopped chat that resumes on input: typing works, pickers would hit
+    // the stopped agent.
+    renderInputBar({ disabled: false, controlsDisabled: true })
+    const trigger = await screen.findByRole('button', {
+      name: /Switch agent\. Currently Cursor/
+    })
+    expect(trigger).toBeDisabled()
+    expect(screen.getByRole('button', { name: /^Agent$/ })).toBeDisabled()
+    expect(screen.queryByText('Session closed')).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(document.querySelector('[data-composer-editor="true"] p')).toHaveAttribute(
+        'data-placeholder',
+        'Ask anything… (/ for commands, @ for files)'
+      )
+    })
+  })
+
+  it('hides slash-menu mode and config rows via controlsDisabled while commands still list', async () => {
+    const commands = [{ name: 'compact', description: 'Compact the conversation' }]
+    const openSlashMenu = async (): Promise<HTMLElement> => {
+      await waitFor(() => {
+        expect(document.querySelector('[data-composer-editor="true"]')).not.toBeNull()
+      })
+      setComposerValue('/')
+      return screen.findByRole('listbox')
+    }
+
+    // Baseline: with the controls on, the session's modes list.
+    renderInputBar({ commands })
+    expect(within(await openSlashMenu()).getByText('Plan')).toBeInTheDocument()
+    cleanup()
+
+    // Modes only (no config options): no Plan/Ask rows, the command stays.
+    renderInputBar({ commands, disabled: false, controlsDisabled: true })
+    let listbox = await openSlashMenu()
+    expect(within(listbox).getByText('/compact')).toBeInTheDocument()
+    expect(within(listbox).queryByText('Plan')).not.toBeInTheDocument()
+    expect(within(listbox).queryByText('Ask')).not.toBeInTheDocument()
+    cleanup()
+
+    // Config options (which replace the mode rows when present): none list.
+    const effort = option('effort', 'Effort', 'other', 'low', [
+      { value: 'low', name: 'Low effort' },
+      { value: 'high', name: 'High effort' }
+    ])
+    renderInputBar({ commands, configOptions: [effort] })
+    expect(within(await openSlashMenu()).getByText('High effort')).toBeInTheDocument()
+    cleanup()
+    renderInputBar({
+      commands,
+      configOptions: [effort],
+      disabled: false,
+      controlsDisabled: true
+    })
+    listbox = await openSlashMenu()
+    expect(within(listbox).getByText('/compact')).toBeInTheDocument()
+    expect(within(listbox).queryByText('High effort')).not.toBeInTheDocument()
+    expect(within(listbox).queryByText('Low effort')).not.toBeInTheDocument()
+  })
+
   it('cancel affordance clears the armed switch', async () => {
     mockSwitching.current = { toConfigId: 'acp-registry:claude-acp', status: 'pending' }
     renderInputBar()
@@ -883,6 +995,44 @@ describe('ChatInputBar placeholder', () => {
         'Ask anything… (/ for commands, @ for files)'
       )
     })
+  })
+})
+
+describe('ChatInputBar Claude limit warning', () => {
+  beforeEach(() => {
+    limitWarningRef.current = true
+  })
+  afterEach(() => {
+    limitWarningRef.current = false
+  })
+
+  it('shows the warning inside the composer card, at its top', () => {
+    const { container } = renderInputBar()
+    const composer = container.querySelector('[data-chat-composer="true"]')
+    const warning = screen.getByTestId('claude-limit-warning-stub')
+    expect(composer).toContainElement(warning)
+    expect(warning).toHaveAttribute('data-at-top', 'true')
+  })
+
+  it('puts the warning below a pending permission prompt', () => {
+    renderInputBar({
+      permission: {
+        requestId: 'permission-1',
+        agentId: 'agent-1',
+        sessionId: 'session-1',
+        toolCall: { title: 'Approve Spec' },
+        options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }]
+      }
+    })
+    const prompt = screen.getByTestId('permission-prompt')
+    const warning = screen.getByTestId('claude-limit-warning-stub')
+    expect(prompt.compareDocumentPosition(warning) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(warning).toHaveAttribute('data-at-top', 'false')
+  })
+
+  it('hides the warning while the chat is closed', () => {
+    renderInputBar({ controlsDisabled: true })
+    expect(screen.queryByTestId('claude-limit-warning-stub')).not.toBeInTheDocument()
   })
 })
 
@@ -1179,11 +1329,14 @@ describe('ChatInputBar command chip', () => {
     // Select the command
     await selectSlashOption('/compact')
 
-    // Command pill should render inline (the CommandPill NodeView renders the
-    // SkillChip with name prefixed by `/` so the visible text is `/compact`).
+    // Command pill: terminal icon and muted `/compact`, not the skill sparkles.
     await waitFor(() => {
       expect(screen.getByText('/compact')).toBeInTheDocument()
     })
+    const commandPill = document.querySelector('[data-command-pill="true"]')
+    expect(commandPill?.querySelector('svg[data-termul-icon="TerminalSquare"]')).not.toBeNull()
+    expect(commandPill?.querySelector('svg[data-termul-icon="Sparkles"]')).toBeNull()
+    expect(commandPill?.querySelector('.text-muted-foreground')).not.toBeNull()
   })
 
   it('sends the command-prefixed wire with token display blocks on send', async () => {
@@ -1206,8 +1359,7 @@ describe('ChatInputBar command chip', () => {
     // Send
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
-    // Wire: `/compact hello` (byte-identical to the plain-prefix path).
-    // Display: the raw token text so the timeline renders the command chip.
+    // Wire: `/compact` stays where the token was. Display keeps the token.
     await waitFor(() => {
       expect(onSendBlocks).toHaveBeenCalledWith(
         [{ type: 'text', text: '/compact hello' }],
@@ -1299,6 +1451,41 @@ describe('ChatInputBar command chip', () => {
     expect(
       editor!.querySelector('[data-command-pill="true"][data-command-name="compact"]')
     ).not.toBeNull()
+    expect(mockToastError).toHaveBeenCalledWith('This message already has a command.')
+  })
+
+  it('keeps a command picked in the middle of a sentence in that place', async () => {
+    const onSendBlocks = vi.fn()
+    const commands = [{ name: 'compact', description: 'Compact the conversation' }]
+    renderInputBar({ commands, onSendBlocks })
+
+    setComposerValue('buatkan design baru /compact')
+
+    await selectSlashOption('/compact')
+
+    await waitFor(() => {
+      expect(getComposerValue()).toBe(`buatkan design baru ${commandToken('compact')} `)
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
+
+    await waitFor(() => {
+      expect(onSendBlocks).toHaveBeenCalledWith(
+        [{ type: 'text', text: 'buatkan design baru /compact' }],
+        [{ type: 'text', text: `buatkan design baru ${commandToken('compact')}` }]
+      )
+    })
+  })
+
+  it('keeps a stored mid-sentence command where the draft put it', async () => {
+    const commands = [{ name: 'compact', description: 'Compact' }]
+    renderInputBar({ commands })
+
+    setComposerValue(`buatkan ${commandToken('compact')} design`)
+
+    await waitFor(() => {
+      expect(getComposerValue()).toBe(`buatkan ${commandToken('compact')} design`)
+    })
   })
 
   it('sends just the command (token display) when no message is typed', async () => {
@@ -1347,14 +1534,12 @@ describe('ChatInputBar command chip', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Send message' }))
 
-    // Wire: `/<name> ` prefix + the image block (byte-identical to the
-    // pre-token plain-prefix path). Display: raw token text + the image
-    // block so the timeline renders the command chip inline.
+    // Wire keeps `/compact` where the pill was. Display keeps the token.
     const imageBlock = { type: 'image', mimeType: 'image/png', data: 'c2NyZWVuc2hvdA==' }
     await waitFor(() => {
       expect(onSendBlocks).toHaveBeenCalledWith(
-        [{ type: 'text', text: '/compact ' }, imageBlock],
-        [{ type: 'text', text: commandToken('compact') }, imageBlock]
+        [{ type: 'text', text: '/compact' }, imageBlock],
+        [{ type: 'text', text: `${commandToken('compact')} ` }, imageBlock]
       )
     })
   })
@@ -1420,6 +1605,99 @@ describe('ChatInputBar command chip', () => {
     await waitFor(() => {
       expect(screen.getByRole('listbox')).toBeInTheDocument()
     })
+  })
+})
+
+/** A paste event carrying plain text (jsdom has no ClipboardEvent/DataTransfer). */
+function textPasteEvent(text: string): Event {
+  const clipboardData = {
+    types: ['text/plain'],
+    getData: (type: string) => (type === 'text/plain' || type === 'text' ? text : ''),
+    setData: () => {},
+    items: [],
+    files: [] as File[]
+  }
+  const ev = new Event('paste', { bubbles: true, cancelable: true })
+  Object.defineProperty(ev, 'clipboardData', { value: clipboardData, configurable: true })
+  return ev
+}
+
+function pasteIntoComposer(text: string): void {
+  const el = document.querySelector('[data-composer-editor="true"]')
+  if (!el) throw new Error('composer editor not mounted')
+  act(() => {
+    el.dispatchEvent(textPasteEvent(text))
+  })
+}
+
+// spec-idle-stopped-chat-seamless-resume: the draft-start signal pre-warms
+// the resume of a stopped chat.
+describe('ChatInputBar draft start', () => {
+  beforeEach(() => {
+    persistenceStore.clear()
+    fakePersistenceApi.readFails = false
+  })
+
+  it('fires onDraftStart on the first keystroke into an empty draft only', async () => {
+    const onDraftStart = vi.fn()
+    renderInputBar({ onDraftStart })
+    await waitFor(() => {
+      expect(document.querySelector('[data-composer-editor="true"]')).not.toBeNull()
+    })
+    expect(onDraftStart).not.toHaveBeenCalled()
+    setComposerValue('c')
+    setComposerValue('co')
+    expect(onDraftStart).toHaveBeenCalledTimes(1)
+    // Emptying the draft and typing again is a new draft start.
+    setComposerValue('')
+    setComposerValue('n')
+    expect(onDraftStart).toHaveBeenCalledTimes(2)
+  })
+
+  it('fires once for a paste into an empty draft', async () => {
+    const onDraftStart = vi.fn()
+    renderInputBar({ onDraftStart })
+    await waitFor(() => {
+      expect(document.querySelector('[data-composer-editor="true"]')).not.toBeNull()
+    })
+    pasteIntoComposer('pasted text')
+    expect(onDraftStart).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not fire for a paste into a non-empty draft', async () => {
+    const onDraftStart = vi.fn()
+    renderInputBar()
+    await waitFor(() => {
+      expect(document.querySelector('[data-composer-editor="true"]')).not.toBeNull()
+    })
+    setComposerValue('already typing')
+    cleanup()
+    // Same draft, now with the callback wired: the paste is not a draft start.
+    persistenceStore.set('chat-draft/p1/session-1', 'already typing')
+    renderInputBar({ onDraftStart })
+    await waitFor(() => {
+      expect(getComposerValue()).toBe('already typing')
+    })
+    pasteIntoComposer(' more')
+    expect(onDraftStart).not.toHaveBeenCalled()
+  })
+
+  it('does not fire for a restored draft', async () => {
+    persistenceStore.set('chat-draft/p1/session-1', 'half-typed message')
+    const onDraftStart = vi.fn()
+    renderInputBar({ onDraftStart })
+    await waitFor(() => {
+      expect(getComposerValue()).toBe('half-typed message')
+    })
+    expect(onDraftStart).not.toHaveBeenCalled()
+  })
+
+  it('shows the Session closed pill only while disabled', () => {
+    const { unmount } = renderInputBar({ disabled: true })
+    expect(screen.getByText('Session closed')).toBeInTheDocument()
+    unmount()
+    renderInputBar({ disabled: false })
+    expect(screen.queryByText('Session closed')).not.toBeInTheDocument()
   })
 })
 

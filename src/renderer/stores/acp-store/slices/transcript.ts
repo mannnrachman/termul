@@ -3,6 +3,10 @@
  */
 
 import type { StateCreator } from 'zustand'
+import {
+  alignSessionModelProjection,
+  withSessionModelOnIndex
+} from '@/components/chat/chat-input-bar-config'
 import { stripHandoffPreamble } from '@/components/chat/handoff-summary'
 import { applyTerminalStream, type TerminalStreamFields } from '@/components/chat/terminal-output'
 import type {
@@ -18,6 +22,8 @@ import {
   getCachedSessionPayload,
   loadSessionPayload,
   markSessionPayloadPinned,
+  reloadSessionPayloadFromHost,
+  type SessionPayload,
   setCachedSessionPayload,
   unpinSessionPayload
 } from '@/lib/acp-history-persistence'
@@ -26,7 +32,6 @@ import { wireBlocksToDisplay } from '@/lib/skills-wire-reverse'
 import {
   acceptsSessionTranscriptEvents,
   cacheOptionsFromSession,
-  dropHiddenTranscriptTurns,
   dropPlanForSession,
   dropRecordKey,
   hasActiveAssistantTail,
@@ -37,31 +42,55 @@ import {
   mayStartChunkMessage,
   mergeAgentConfigOptions,
   newId,
-  normalizeUserMessages,
   SWITCH_SPLICE_ID_PREFIX,
   sessionTurnBusy,
   toolIntervened,
-  trimLiveToolCalls
+  trimLiveToolCalls,
+  withCommands
 } from '../helpers'
 import { useAcpStore } from '../index'
 import {
   activeWirePromptTurns,
+  bugReportCollectors,
   commitMessageCollectors,
   echoedWirePromptTurns,
   handoffOnlyTurnIds,
   historySeqWatermarks,
   isHistoryCoveredEvent,
+  isHistoryCoveredToolEvent,
   liveSwitchSources,
+  liveTurnReplaySeq,
+  MAX_BUG_REPORT_RESPONSE_CHARS,
   MAX_COMMIT_MESSAGE_RESPONSE_CHARS,
   MAX_TERMINAL_ASSIST_RESPONSE_CHARS,
   nextSeq,
   persistSession,
+  rejectBugReportCollector,
   rejectCommitMessageCollector,
   rejectTerminalAssistCollector,
   terminalAssistCollectors
 } from '../shared-state'
-import type { AcpState, ChatMessage, MessageRole, OpenCodeSessionNotice } from '../types'
+import { mergedLifecycleField, withCodexThreadStates } from '../subagent-lifecycle'
+import {
+  appendSubagentChunk,
+  MAX_SUBAGENT_TEXT_CHARS,
+  withSubagentIngest
+} from '../subagent-transcript'
+import type {
+  AcpSession,
+  AcpState,
+  ChatMessage,
+  MessageRole,
+  OpenCodeSessionNotice
+} from '../types'
 import { clearPromptReconcile, clearPromptReconcileForTurn } from './prompt-reconcile'
+import {
+  anchorIndex,
+  newestOfPreviousBand,
+  olderInSourceBand,
+  renderableRows,
+  spliceOrigin
+} from './switch-seam'
 import { createFlushClock, type FlushTier } from './transcript-flush-clock'
 
 function sameOpencodeNotice(
@@ -525,6 +554,23 @@ export function clampLiveToolCallFields<T extends LiveToolCallShape>(
     reduced.locations = next.locations
   }
   if (next.rawOutput !== undefined) reduced.rawOutput = next.rawOutput
+  // Three scalars from the ingest extractor: tiny and bounded.
+  if (next.subagentUsage !== undefined && serializedLength(next.subagentUsage) <= 256) {
+    reduced.subagentUsage = next.subagentUsage
+  }
+  // Ingest caps each lifecycle string at 512 chars, so this stays small too.
+  if (next.subagentLifecycle !== undefined && serializedLength(next.subagentLifecycle) <= 2048) {
+    reduced.subagentLifecycle = next.subagentLifecycle
+  }
+  if (typeof next.parentToolCallId === 'string' && next.parentToolCallId.length <= 512) {
+    reduced.parentToolCallId = next.parentToolCallId
+  }
+  if (
+    typeof next.subagentText === 'string' &&
+    next.subagentText.length <= MAX_SUBAGENT_TEXT_CHARS
+  ) {
+    reduced.subagentText = next.subagentText
+  }
   if (
     typeof next.terminalOutput === 'string' &&
     next.terminalOutput.length <= MAX_LIVE_TOOL_CALL_FIELD_CHARS
@@ -626,6 +672,25 @@ export function trimLiveWindow(messages: ChatMessage[], sessionId: SessionId): C
   return messages.slice(messages.length - keepCount)
 }
 
+/** The seq a bubble's durable twin carries in the host log. */
+function hostSeqOf(message: ChatMessage): number | undefined {
+  return message.hostSeq ?? message.seq
+}
+
+/**
+ * True when `payload` already holds the window's oldest bubble, so paging from
+ * it lands right before that bubble. A cached copy left by the trim probe stops
+ * at the host seq it was read at, and live events never extend it. A head
+ * without a host seq (this client's optimistic `turn:*` prompt, whose echo is
+ * deduped) is never proven covered: its `seq` is a renderer counter.
+ */
+function payloadReachesHead(payload: SessionPayload, head: ChatMessage): boolean {
+  if (head.id.startsWith(SWITCH_SPLICE_ID_PREFIX)) return true
+  if (payload.messages.some((m) => m.id === head.id)) return true
+  const lastSeq = payload.metadata.lastSeq
+  return head.hostSeq !== undefined && lastSeq !== undefined && head.hostSeq <= lastSeq
+}
+
 /**
  * CAP-1 durability-probe bookkeeping. `trimLiveWindow` fires one async
  * `loadSessionPayload` per cold-cache over-limit session;
@@ -640,25 +705,17 @@ const inFlightDurabilityProbes = new Set<SessionId>()
 const untrimmableSessions = new Set<SessionId>()
 
 /**
- * Free per-session transcript maps held in the WebView heap.
- * Disk history is untouched — reopen lazy-loads via `openHistorySession`.
- * Call only after any needed `persistSession` so the last mirror is flushed.
+ * Drop per-session module-level bookkeeping so a closed/deleted session never
+ * leaks a backfill allowance, an in-flight load guard, a stale history
+ * watermark, a durability-probe/untrimmable mark, a pending prompt command, or
+ * a live-switch link (a recreated session must re-establish its own; a
+ * resolving probe must not resurrect a pin). Runs on every close, including a
+ * close that keeps the transcript maps for an open chat tab.
  */
-export function dropSessionTranscriptState(
-  state: Pick<
-    AcpState,
-    'messages' | 'toolCalls' | 'agentSwitches' | 'commands' | 'sessionUsage' | 'plans'
-  >,
-  sessionId: SessionId
-): Pick<
-  AcpState,
-  'messages' | 'toolCalls' | 'agentSwitches' | 'commands' | 'sessionUsage' | 'plans'
-> {
-  // Drop per-session module-level bookkeeping too so a closed/deleted session
-  // never leaks a backfill allowance, an in-flight load guard, a stale history
-  // watermark, a durability-probe/untrimmable mark, or clamp-log dedup entries
-  // (a recreated session must re-establish its own; a resolving probe must not
-  // resurrect a pin).
+export function dropSessionBookkeeping(
+  sessionId: SessionId,
+  opts: { keepLiveSwitchLinks?: boolean } = {}
+): void {
   backfillCounts.delete(sessionId)
   // A pending (unconfirmed) prompt command — its reconcile timer, store flag and
   // wire-turn tracking — dies with the session: nothing may resend into it.
@@ -669,12 +726,34 @@ export function dropSessionTranscriptState(
   historySeqWatermarks.delete(sessionId)
   inFlightDurabilityProbes.delete(sessionId)
   untrimmableSessions.delete(sessionId)
+  // A close that keeps the transcript for an open tab keeps the links too: a
+  // later history reopen re-splices the pre-switch conversation through them.
+  if (opts.keepLiveSwitchLinks) return
   // Live-switch source links die with either endpoint: the target's entry
   // outright, and any entry pointing at the dropped session as source.
   liveSwitchSources.delete(sessionId)
-  for (const [target, source] of liveSwitchSources) {
-    if (source === sessionId) liveSwitchSources.delete(target)
+  for (const [target, link] of liveSwitchSources) {
+    if (link.sourceId === sessionId) liveSwitchSources.delete(target)
   }
+}
+
+export type SessionTranscriptState = Pick<
+  AcpState,
+  'messages' | 'toolCalls' | 'agentSwitches' | 'commands' | 'commandsSeq' | 'sessionUsage' | 'plans'
+>
+
+/**
+ * Free per-session transcript maps held in the WebView heap, plus the
+ * session's bookkeeping (`dropSessionBookkeeping`), clamp-log dedup entries
+ * and payload pin. Disk history is untouched — reopen lazy-loads via
+ * `openHistorySession`. Call only after any needed `persistSession` so the
+ * last mirror is flushed. Idempotent.
+ */
+export function dropSessionTranscriptState(
+  state: SessionTranscriptState,
+  sessionId: SessionId
+): SessionTranscriptState {
+  dropSessionBookkeeping(sessionId)
   for (const call of state.toolCalls[sessionId] ?? []) {
     clampedToolCallIds.delete(clampLogKey(call.toolCallId))
   }
@@ -684,6 +763,7 @@ export function dropSessionTranscriptState(
     toolCalls: dropRecordKey(state.toolCalls, sessionId),
     agentSwitches: dropRecordKey(state.agentSwitches, sessionId),
     commands: dropRecordKey(state.commands, sessionId),
+    commandsSeq: dropRecordKey(state.commandsSeq, sessionId),
     sessionUsage: dropRecordKey(state.sessionUsage, sessionId),
     plans: dropRecordKey(state.plans, sessionId)
   }
@@ -854,6 +934,7 @@ type TranscriptSliceState = Pick<
   | 'toolCalls'
   | 'plans'
   | 'commands'
+  | 'commandsSeq'
   | 'loadOlderMessages'
   | 'clearSessionBackfill'
   | '_onUserPrompt'
@@ -876,6 +957,7 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
   toolCalls: {},
   plans: {},
   commands: {},
+  commandsSeq: {},
 
   // --- Live window: scroll-up lazy-load -------------------------------------
 
@@ -884,7 +966,9 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
    * Reads the full payload via `loadSessionPayload` (cached module-side so
    * re-hydrations don't re-read disk), finds messages older than the
    * window's oldest retained id, and prepends the next `count` into the
-   * in-memory window. Idempotent at the history head (no infinite loop).
+   * in-memory window. A switched chat pages on past its own head into the
+   * spliced bands of earlier agents, read from each source session's log.
+   * Idempotent at the history head (no infinite loop).
    * Reversible trim — disk format unchanged.
    */
   loadOlderMessages: async (sessionId, count) => {
@@ -895,53 +979,45 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
       // Best-effort read: a disk/server failure must not surface as an
       // unhandled promise rejection in the UI — the reader keeps the current
       // view and can retry by scrolling up again.
-      const payload = await loadSessionPayload(sessionId).catch((e: unknown) => {
+      let payload = await loadSessionPayload(sessionId).catch((e: unknown) => {
         console.warn('[acp] loadOlderMessages: payload read failed', e)
         return null
       })
       if (!payload) return
-      // Re-read current state after the async gap — new chunks may have arrived.
-      const current = get().messages[sessionId] ?? []
-      if (current.length === 0) return
-      const oldestId = current[0].id
-      // spec-agent-switch-live-merged-transcript: a spliced head can never
-      // anchor — its durable home is the SOURCE session's log (namespaced id,
-      // negative-band seq), not this session's payload. Cross-seam paging is
-      // a declared limitation (spec design notes); info, not warn — this is
-      // the expected boundary, not a failure.
-      if (oldestId.startsWith(SWITCH_SPLICE_ID_PREFIX)) {
-        void logFrontendError({
-          level: 'info',
-          source: 'acp.loadOlderMessages',
-          message: `Scroll-back for session ${sessionId} reached the switch-splice seam; pre-switch records are not restorable from this session's payload`
-        })
-        return
-      }
-      // Hidden turns never render — the backfill window must not resurrect the
-      // greeting prefix when scrolling to the transcript head.
-      const fullMessages = normalizeUserMessages(dropHiddenTranscriptTurns(payload.messages))
-      let oldestIdx = fullMessages.findIndex((m) => m.id === oldestId)
-      if (oldestIdx === -1) {
-        // Id anchor missed: the live head's id is absent from the persisted
-        // payload. This happens when the live head is a locally-created
-        // bubble (live-only session, or created after the last persist), and
-        // historically when a tail fold minted a window-local `snapshot:` id
-        // for a run that opened before the tail window (the backend now
-        // deepens the window to a fold boundary, but persisted installs may
-        // still carry the drift). Fall back to seq anchoring: the bubble that
-        // contains `oldestSeq` is the last persisted message whose seq is at
-        // or below it — restored ids share the persisted seq domain, and the
-        // live counter is rebased above the max restored seq on install.
-        const oldestSeq = current[0].seq
-        if (typeof oldestSeq === 'number' && Number.isFinite(oldestSeq)) {
-          for (let i = fullMessages.length - 1; i >= 0; i -= 1) {
-            const seq = fullMessages[i].seq
-            if (typeof seq === 'number' && Number.isFinite(seq) && seq <= oldestSeq) {
-              oldestIdx = i
-              break
-            }
-          }
+      const headAtRead = get().messages[sessionId]?.[0]
+      if (headAtRead && !payloadReachesHead(payload, headAtRead)) {
+        try {
+          payload = (await reloadSessionPayloadFromHost(sessionId)) ?? payload
+        } catch {
+          void logFrontendError({
+            level: 'warn',
+            source: 'acp.loadOlderMessages',
+            message: `Host re-read for session ${sessionId.slice(0, 8)}… failed; scroll-back waits for the next scroll-up instead of paging from a stale copy`
+          })
+          return
         }
+      }
+      // Re-read current state after the async gap — new chunks may have arrived.
+      const head = get().messages[sessionId]?.[0]
+      if (!head) return
+      const origin = spliceOrigin(head.id)
+      let older: ChatMessage[] | null
+      // Payload ids, kept only when the head anchored on its renderer seq. Only
+      // then can a live bubble's persisted twin sit inside the page under
+      // another id: a host-stamped head anchors exactly.
+      let persistedIds: Set<string> | null = null
+      if (origin) {
+        older = await olderInSourceBand(origin, head, count, get().agentSwitches[sessionId] ?? [])
+      } else {
+        // Hidden turns never render — the backfill window must not resurrect the
+        // greeting prefix when scrolling to the transcript head.
+        const fullMessages = renderableRows(payload)
+        // An id miss means the live head is a locally-created bubble (`msg-*`
+        // streams, whose twins carry `snapshot:*`/`user:seq-*` ids), or a
+        // persisted install whose tail fold minted a window-local `snapshot:` id
+        // before the backend deepened tail windows to a fold boundary. The seq
+        // anchor finds the persisted bubble that contains the head's host seq.
+        const oldestIdx = anchorIndex(fullMessages, head.id, hostSeqOf(head))
         if (oldestIdx === -1) {
           void logFrontendError({
             level: 'warn',
@@ -950,50 +1026,68 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
           })
           return
         }
-        void logFrontendError({
-          level: 'warn',
-          source: 'acp.loadOlderMessages',
-          message: `Oldest live message id for session ${sessionId} missing from persisted payload; anchored scroll-back by seq at index ${oldestIdx}`
-        })
+        if (fullMessages[oldestIdx].id !== head.id) {
+          void logFrontendError({
+            level: 'warn',
+            source: 'acp.loadOlderMessages',
+            message: `Oldest live message id for session ${sessionId} missing from persisted payload; anchored scroll-back by seq at index ${oldestIdx}`
+          })
+          if (head.hostSeq === undefined) persistedIds = new Set(fullMessages.map((m) => m.id))
+        }
+        older = fullMessages.slice(Math.max(0, oldestIdx - count), oldestIdx)
       }
-      // Already at the head: no older messages (idempotent — prevents
-      // infinite scroll-up loops).
-      if (oldestIdx === 0) return
-      const start = Math.max(0, oldestIdx - count)
-      const older = fullMessages.slice(start, oldestIdx)
-      if (older.length === 0) return
+      if (older === null) return
+      // At the head of a band: a switched chat continues into the band spliced
+      // before it.
+      const crossedSeam = older.length === 0
+      const seqAnchoredIds = crossedSeam ? null : persistedIds
+      const page = crossedSeam
+        ? await newestOfPreviousBand(
+            get().agentSwitches[sessionId] ?? [],
+            sessionId,
+            origin?.sourceId ?? sessionId,
+            count
+          )
+        : older
+      if (page.length === 0) return
       set((s) => {
         const live = s.messages[sessionId] ?? []
-        // Deduplicate against the live window — by id AND by content. The id
-        // check catches restored bubbles; the content check catches the
-        // live-only id dialects (`turn:*` optimistic prompts, `msg-*`
-        // streams) whose persisted twins carry `user:seq-*`/`snapshot:*`
-        // ids — otherwise a seq-anchored backfill re-renders the in-flight
-        // turn above the live copy. Matches are consumed seam-ward (the end
-        // of `older` first) so identical repeated content deeper in history
-        // — e.g. the same prompt sent twice — keeps its own copy, and a
-        // chunk arriving between the payload read and this set can't
-        // double-render.
+        // A trim during the awaits moved the head: this page no longer abuts it.
+        if (live[0]?.id !== head.id) return {}
+        // Under an id or host-seq anchor, and on every spliced page, each live
+        // bubble's persisted twin sits at or after the head, so a page row
+        // folds only by id. Equal text in the window is a later message, not
+        // this one. A head anchored on its renderer seq (an unstamped live-only
+        // bubble) can leave twins inside the page under another id. Those fold by host seq, or
+        // by content against bubbles with no persisted identity, consumed
+        // seam-ward so a repeated prompt deeper in the page keeps its copy.
         const liveIds = new Set(live.map((m) => m.id))
+        const liveHostSeqs = new Set(live.map((m) => m.hostSeq))
         const twinUsed = new Array<boolean>(live.length).fill(false)
         const deduped: ChatMessage[] = []
-        for (let i = older.length - 1; i >= 0; i -= 1) {
-          const candidate = older[i]
+        for (let i = page.length - 1; i >= 0; i -= 1) {
+          const candidate = page[i]
           if (liveIds.has(candidate.id)) continue
-          const candidateDistFromEnd = older.length - 1 - i
-          const twin = live.findIndex(
-            (m, index) =>
-              !twinUsed[index] &&
-              isPersistedTwin(
-                candidate,
-                m,
-                live.length - 1 - index - candidateDistFromEnd >= 0 &&
-                  live.length - 1 - index - candidateDistFromEnd <= TWIN_SEAM_SLACK
-              )
-          )
-          if (twin !== -1) {
-            twinUsed[twin] = true
-            continue
+          if (seqAnchoredIds) {
+            if (candidate.seq !== undefined && liveHostSeqs.has(candidate.seq)) continue
+            const candidateDistFromEnd = page.length - 1 - i
+            const twin = live.findIndex(
+              (m, index) =>
+                !twinUsed[index] &&
+                m.hostSeq === undefined &&
+                !seqAnchoredIds.has(m.id) &&
+                !m.id.startsWith(SWITCH_SPLICE_ID_PREFIX) &&
+                isPersistedTwin(
+                  candidate,
+                  m,
+                  live.length - 1 - index - candidateDistFromEnd >= 0 &&
+                    live.length - 1 - index - candidateDistFromEnd <= TWIN_SEAM_SLACK
+                )
+            )
+            if (twin !== -1) {
+              twinUsed[twin] = true
+              continue
+            }
           }
           deduped.push(candidate)
         }
@@ -1111,7 +1205,8 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
         blocks: content,
         streaming: false,
         timestamp: Date.now(),
-        seq: nextSeq()
+        seq: nextSeq(),
+        hostSeq: eventSeq
       }
       if (duplicate) return {}
       return {
@@ -1155,13 +1250,36 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
       }
       return
     }
-    // CAP-3 replay contract: drop chunks the installed payload already covers.
-    if (isHistoryCoveredEvent(e.sessionId, eventSeq)) return
+    const bugReportCollector = bugReportCollectors.get(e.sessionId)
+    if (bugReportCollector) {
+      if (e.role === 'agent' && e.content.type === 'text' && typeof e.content.text === 'string') {
+        bugReportCollector.length += e.content.text.length
+        if (bugReportCollector.length > MAX_BUG_REPORT_RESPONSE_CHARS) {
+          bugReportCollector.reject(new Error('The ACP agent response was too large'))
+        } else {
+          bugReportCollector.chunks.push(e.content.text)
+        }
+      }
+      return
+    }
     // Replay mode replaces the transcript with an immediate set (not a
     // per-token storm). Normal streaming is coalesced via rAF so ≤1 set()
     // fires per animation frame.
     const session = get().sessions[e.sessionId]
     const useCoalesce = !session?.replaying
+    const parentToolCallId = e.parentToolCallId
+    if (parentToolCallId) {
+      // Subagent text belongs to its dispatch card, which the open turn's
+      // attach replay rebuilds, so it follows the tool-event coverage rule.
+      if (isHistoryCoveredToolEvent(e.sessionId, eventSeq)) return
+      const applyChild = (s: AcpState): Partial<AcpState> =>
+        appendSubagentChunk(s, { ...e, parentToolCallId })
+      if (useCoalesce) coalesceSet(e.sessionId, applyChild)
+      else set(applyChild)
+      return
+    }
+    // CAP-3 replay contract: drop chunks the installed payload already covers.
+    if (isHistoryCoveredEvent(e.sessionId, eventSeq)) return
     const apply = (s: AcpState): Partial<AcpState> => {
       const sess = s.sessions[e.sessionId]
       // Drop chunks for unknown or already-closed sessions (no orphan state) —
@@ -1294,6 +1412,7 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
         streaming: true,
         timestamp: Date.now(),
         seq: nextSeq(),
+        hostSeq: eventSeq,
         messageId: e.messageId
       }
       return { messages: { ...s.messages, [e.sessionId]: [...list, message] } }
@@ -1308,17 +1427,21 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
   _onToolCall: (e, eventSeq) => {
     const hadCommit = commitMessageCollectors.has(e.sessionId)
     const hadAssist = terminalAssistCollectors.has(e.sessionId)
+    const hadBugReport = bugReportCollectors.has(e.sessionId)
     if (hadCommit)
       rejectCommitMessageCollector(e.sessionId, 'The ACP agent attempted to use a tool')
     if (hadAssist)
       rejectTerminalAssistCollector(e.sessionId, 'The ACP agent attempted to use a tool')
-    if (hadCommit || hadAssist) return
+    if (hadBugReport) rejectBugReportCollector(e.sessionId, 'The ACP agent attempted to use a tool')
+    if (hadCommit || hadAssist || hadBugReport) return
     if (terminalAssistCollectors.has(e.sessionId)) {
       rejectTerminalAssistCollector(e.sessionId, 'The ACP agent attempted to use a tool')
       return
     }
-    // CAP-3 replay contract: drop events the installed payload already covers.
-    if (isHistoryCoveredEvent(e.sessionId, eventSeq)) return
+    // CAP-3 replay contract: drop events the installed payload already covers,
+    // unless the open turn's attach replay re-delivers them in full.
+    if (isHistoryCoveredToolEvent(e.sessionId, eventSeq)) return
+    const replaySeq = liveTurnReplaySeq(e.sessionId, eventSeq)
     const session = get().sessions[e.sessionId]
     const useCoalesce = !session?.replaying
     const apply = (s: AcpState): Partial<AcpState> => {
@@ -1326,6 +1449,8 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
       if (!acceptsSessionTranscriptEvents(s.sessions[e.sessionId])) return {}
       // Stamp arrival time + monotonic seq (unless already present) so the UI
       // can interleave tool calls with messages on one chronological timeline.
+      // A replayed card keeps its server seq, which places it among the
+      // payload's messages instead of below them.
       // CAP-2/F-2: clamp rawOutput/title/content/rawInput/locations on the
       // initial call. Codex terminal chunks are accumulated first, then the
       // same bound applies so a long shell stream cannot bypass it.
@@ -1334,10 +1459,10 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
       )
       const stream = boundTerminalStream(applyTerminalStream(prior, e.toolCall))
       const stamped = clampLiveToolCallFields(e.sessionId, {
-        ...e.toolCall,
+        ...withSubagentIngest(e.toolCall),
         ...stream,
         timestamp: typeof e.toolCall.timestamp === 'number' ? e.toolCall.timestamp : Date.now(),
-        seq: typeof e.toolCall.seq === 'number' ? e.toolCall.seq : nextSeq()
+        seq: typeof e.toolCall.seq === 'number' ? e.toolCall.seq : (replaySeq ?? nextSeq())
       })
       // Dropped entirely: even the structural subset exceeds the live bound
       // (the agent-sent toolCallId/kind/status alone is oversized).
@@ -1352,7 +1477,10 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
       const idx = list.findIndex((t) => t.toolCallId === e.toolCall.toolCallId)
       if (idx === -1) {
         return {
-          toolCalls: { ...s.toolCalls, [e.sessionId]: [...list, stamped] }
+          toolCalls: {
+            ...s.toolCalls,
+            [e.sessionId]: withCodexThreadStates([...list, stamped], stamped)
+          }
         }
       }
       // Preserve the original timeline placement: a replay (reconnect overlap)
@@ -1364,16 +1492,18 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
       const merged = clampLiveToolCallFields(e.sessionId, {
         ...list[idx],
         ...stamped,
+        ...mergedLifecycleField(list[idx], stamped),
         // A live event turns a restored summary into a real timeline card.
         restoredSummary: undefined,
-        timestamp: list[idx].timestamp,
-        seq: list[idx].seq
+        // A legacy record without ordering stamps adopts the live ones.
+        timestamp: list[idx].timestamp ?? stamped.timestamp,
+        seq: list[idx].seq ?? stamped.seq
       })
       if (!merged) return {}
       const next = [...list]
       next[idx] = merged
       return {
-        toolCalls: { ...s.toolCalls, [e.sessionId]: next }
+        toolCalls: { ...s.toolCalls, [e.sessionId]: withCodexThreadStates(next, merged) }
       }
     }
     if (useCoalesce) {
@@ -1385,8 +1515,9 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
 
   _onToolCallUpdate: (e, eventSeq) => {
     // CAP-3 replay contract: drop events the installed payload already covers
-    // (the restored card already reflects the persisted update).
-    if (isHistoryCoveredEvent(e.sessionId, eventSeq)) return
+    // (the restored card already reflects the persisted update), unless the
+    // open turn's attach replay re-delivers them in full.
+    if (isHistoryCoveredToolEvent(e.sessionId, eventSeq)) return
     const session = get().sessions[e.sessionId]
     const useCoalesce = !session?.replaying
     const apply = (s: AcpState): Partial<AcpState> => {
@@ -1399,18 +1530,26 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
       // the WebView heap. Then clamp the merged call: successive updates
       // carrying different fields would otherwise accumulate past the bound.
       const stream = boundTerminalStream(applyTerminalStream(list[idx], e.update))
-      const clampedUpdate = clampLiveToolCallFields(e.sessionId, { ...e.update, ...stream })
+      const clampedUpdate = clampLiveToolCallFields(e.sessionId, {
+        ...withSubagentIngest(e.update),
+        ...stream
+      })
       if (!clampedUpdate) return {}
       // A live update turns a restored summary into a real timeline card.
       const merged = clampLiveToolCallFields(e.sessionId, {
         ...list[idx],
         ...clampedUpdate,
-        restoredSummary: undefined
+        ...mergedLifecycleField(list[idx], clampedUpdate),
+        restoredSummary: undefined,
+        // A legacy record without ordering stamps adopts live ones, so it
+        // still sorts and splits turns like every live-ingested call.
+        timestamp: list[idx].timestamp ?? Date.now(),
+        seq: list[idx].seq ?? nextSeq()
       })
       if (!merged) return {}
       const next = [...list]
       next[idx] = merged
-      return { toolCalls: { ...s.toolCalls, [e.sessionId]: next } }
+      return { toolCalls: { ...s.toolCalls, [e.sessionId]: withCodexThreadStates(next, merged) } }
     }
     if (useCoalesce) {
       coalesceSet(e.sessionId, apply)
@@ -1430,10 +1569,10 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
       return { plans: { ...s.plans, [e.sessionId]: entries } }
     }),
 
-  _onCommandsUpdate: (e) =>
+  _onCommandsUpdate: (e, point) =>
     set((s) => {
       if (!acceptsSessionTranscriptEvents(s.sessions[e.sessionId])) return {}
-      return { commands: { ...s.commands, [e.sessionId]: e.availableCommands ?? [] } }
+      return withCommands(s, e.sessionId, e.availableCommands ?? [], point)
     }),
 
   _onModeUpdate: (e) => {
@@ -1502,11 +1641,18 @@ export const createTranscriptSlice: StateCreator<AcpState, [], [], TranscriptSli
         creationEchoLogged = { ...creationEchoLogged }
         for (const optionId of preservedOptionIds) creationEchoLogged[optionId] = true
       }
+      const draft: AcpSession = {
+        ...session,
+        configOptions: merged,
+        creationEchoLogged
+      }
+      const next = alignSessionModelProjection(draft)
       return {
         sessions: {
           ...s.sessions,
-          [e.sessionId]: { ...session, configOptions: merged, creationEchoLogged }
-        }
+          [e.sessionId]: next
+        },
+        sessionIndex: withSessionModelOnIndex(s.sessionIndex, e.sessionId, next)
       }
     })
     for (const optionId of preservedOptionIds) {

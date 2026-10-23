@@ -1,9 +1,12 @@
 //! Shared crash-consistent same-directory atomic file replacement.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
+use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Atomically replace `path` with `bytes` using a same-directory temp file.
 ///
@@ -36,6 +39,37 @@ pub fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&tmp);
+    }
+    write_result
+}
+
+/// [`replace`] for the entry `name` of the open directory `dir`. The temp
+/// file and the rename name entries of `dir` itself, never a path, so a
+/// folder above it swapped for a link after `dir` was opened cannot move the
+/// write elsewhere.
+#[cfg(unix)]
+pub fn replace_at(dir: BorrowedFd<'_>, name: &OsStr, bytes: &[u8]) -> io::Result<()> {
+    use rustix::fs::{fsync, openat, renameat, unlinkat, AtFlags, Mode, OFlags};
+    let tmp = temp_name(name);
+    let write_result = (|| -> io::Result<()> {
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut file = fs::File::from(openat(
+            dir,
+            tmp.as_str(),
+            flags,
+            Mode::from_raw_mode(0o666),
+        )?);
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        renameat(dir, tmp.as_str(), dir, name)?;
+        fsync(dir)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = unlinkat(dir, tmp.as_str(), AtFlags::empty());
     }
     write_result
 }
@@ -237,14 +271,46 @@ pub fn peek_schema_version(bytes: &[u8]) -> Option<u32> {
 }
 
 fn temp_path(path: &Path) -> PathBuf {
-    path.with_file_name(format!(
+    path.with_file_name(temp_name(path.file_name().unwrap_or_default()))
+}
+
+fn temp_name(name: &OsStr) -> String {
+    format!(
         "{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("artifact"),
+        name.to_str().unwrap_or("artifact"),
         std::process::id(),
         unique_suffix()
-    ))
+    )
+}
+
+/// Whether `path` is a temp file [`replace`] or [`create_new`] made for a
+/// target named `target_name`, last written more than `max_age` ago.
+pub fn is_stale_temp(path: &Path, target_name: &str, max_age: Duration) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| is_temp_name(name, target_name))
+        && fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > max_age)
+}
+
+fn is_temp_name(file_name: &str, target_name: &str) -> bool {
+    let Some(stamp) = file_name
+        .strip_prefix(target_name)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = stamp.split('.');
+    let mut numeric = || {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    numeric() && numeric() && parts.next().is_none()
 }
 
 fn unique_suffix() -> u128 {

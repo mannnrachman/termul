@@ -20,8 +20,17 @@
 //! Desktop + standalone parity: no `tauri-plugin-mcp-bridge` / `AppHandle` —
 //! pure `rmcp` + tokio, works on both binaries.
 
+pub mod bridge;
+pub mod canvas;
+pub mod canvas_budget;
+pub mod canvas_policy;
+pub mod canvas_tools;
 pub mod child;
 pub mod parent;
+pub mod presence;
+
+#[cfg(test)]
+mod gateway_harness;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,6 +82,16 @@ Reference files as markdown links `[label](path)`: Termul renders them as button
 the file in its built-in editor — absolute and cwd-relative paths inside the session workspace \
 roots work, a `:line` suffix (or `#L<line>` on the link target) positions the cursor, and \
 bare multi-segment file paths in prose become open-in-editor links too.";
+
+/// The full `instructions` of the child's `initialize` result: the chat
+/// guidance, then the design canvas guide.
+#[must_use]
+pub fn session_instructions() -> String {
+    format!(
+        "{TERMUL_CHAT_INSTRUCTIONS}\n\n{}",
+        canvas_tools::instructions()
+    )
+}
 
 /// Input the agent sends to `plan` (the `arguments` of `tools/call`).
 /// Also re-used as the parent–child TCP frame body (one todo per plan entry).
@@ -126,6 +145,46 @@ pub enum FrameKind {
     /// `browser` tool call — action + args forwarded to
     /// `browser_automation::dispatch`; the reply carries `result`/`code`.
     Browser,
+    /// `ask_user` tool call (issue #784): the parent shows the question panel
+    /// and holds the reply until the user answers or the call is cancelled.
+    AskUser,
+    /// A figcraft control-protocol call from the canvas `Bridge` backend,
+    /// routed to the renderer that holds the session's project canvas.
+    Canvas,
+}
+
+/// One option the agent offers in an `ask_user` question.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TermulAskUserOption {
+    /// Text shown on the choice and returned in `answers` when picked.
+    pub label: String,
+    /// Optional context shown under the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Input the agent sends to `ask_user`. The answer returns as the tool result
+/// `{"answers": [...], "free_text": "..." | null, "cancelled": bool}`.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TermulAskUserInput {
+    /// The question to put to the user.
+    pub question: String,
+    /// Choices the user can pick from. May be empty when only free text fits.
+    #[serde(default)]
+    pub options: Vec<TermulAskUserOption>,
+    /// Allow more than one option to be picked.
+    #[serde(default)]
+    pub multi_select: bool,
+    /// Show a free-text field next to the options. Defaults to true.
+    #[serde(default = "default_allow_free_text")]
+    pub allow_free_text: bool,
+    /// Optional short heading shown above the question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+}
+
+fn default_allow_free_text() -> bool {
+    true
 }
 
 /// Input the agent sends to the `browser` tool. `action` selects the verb;
@@ -296,6 +355,10 @@ impl<'de> Deserialize<'de> for TermulBrowserInput {
     }
 }
 
+/// The parent reads at most this much of a child's request line, newline
+/// included, so a misbehaving peer cannot grow it unbounded.
+pub const MAX_REQUEST_FRAME_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FrameRequest {
     pub token: String,
@@ -316,6 +379,18 @@ pub struct FrameRequest {
     pub browser_args: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_element: Option<String>,
+    /// The question of an `AskUser` frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask: Option<TermulAskUserInput>,
+    /// figcraft method of a `Canvas` frame (`engine.execute`, `node.get`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_method: Option<String>,
+    /// JSON text of a `Canvas` frame's params, forwarded unparsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_params: Option<String>,
+    /// The agent tool a `Canvas` frame serves, for the gateway's logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_tool: Option<String>,
 }
 
 /// Parent reply frame (one per connection). `result` carries the browser

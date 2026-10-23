@@ -28,7 +28,9 @@ import { isTerminalPendingPtyAssignment } from '@/hooks/use-terminal-restore'
 import { terminalApi } from '@/lib/api'
 import { openTerminalUrl } from '@/lib/browser/terminal-url-navigation'
 import { buildTerminalPathLinks, openFilePathFromTerminal } from '@/lib/file-path-links'
+import { MONO_STACK } from '@/lib/font-stacks'
 import { logFrontendError } from '@/lib/log-api'
+import { ensureMonoFontLoaded, isMonoFontReady, MONO_FONT_LOAD_TIMEOUT_MS } from '@/lib/mono-font'
 import { isMac } from '@/lib/platform'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import {
@@ -42,7 +44,6 @@ import { isWebTerminalBufferable, onWebTerminalSessionLost } from '@/lib/web-ter
 import { useAcpStore } from '@/stores/acp-store'
 import {
   useTerminalBufferSize,
-  useTerminalFontFamily,
   useTerminalFontSize,
   useTerminalRenderer,
   useTerminalScreenReaderMode
@@ -169,8 +170,10 @@ function ConnectedTerminalComponent({
     })
   )
 
-  const fontFamily = useTerminalFontFamily()
   const fontSize = useTerminalFontSize()
+  // Stay false until Paper Mono can be measured, so the first xterm fit uses
+  // the real glyph width. Runtimes without the Font Loading API start ready.
+  const [monoFontReady, setMonoFontReady] = useState(() => isMonoFontReady(fontSize))
   const bufferSize = useTerminalBufferSize()
   const rendererPreference = useTerminalRenderer()
   // Read at construction only (both terminalOptions merges below): a live
@@ -520,6 +523,7 @@ function ConnectedTerminalComponent({
   // Initialize terminal, set up IPC listeners, and spawn PTY
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally narrow deps; a full list would recreate the terminal instance on every render
   useEffect(() => {
+    if (!monoFontReady) return
     const debugId = `${instanceId}-${Date.now().toString().slice(-6)}`
 
     devLog(`[ConnectedTerminal] MOUNT [${debugId}]`, {
@@ -558,7 +562,7 @@ function ConnectedTerminalComponent({
     // Merge platform-aware options with dynamic app settings
     const terminalOptions = {
       ...getTerminalOptions(navigator.platform),
-      fontFamily,
+      fontFamily: MONO_STACK,
       fontSize,
       scrollback: bufferSize,
       screenReaderMode
@@ -1380,17 +1384,62 @@ function ConnectedTerminalComponent({
       webglContextLostRef.current = false
       loadWebglAddonRef.current = null
     }
-  }, [])
+  }, [monoFontReady])
 
-  // Update terminal font settings when app settings change (without recreating terminal)
+  // Apply a font-size change after Paper Mono is measured. Family stays Paper Mono.
+  // Runtimes without the Font Loading API apply in this effect, same as before.
   // biome-ignore lint/correctness/useExhaustiveDependencies: performFit is render-stable by design
   useEffect(() => {
-    if (terminalRef.current) {
-      terminalRef.current.options.fontFamily = fontFamily
-      terminalRef.current.options.fontSize = fontSize
-      performFit(true)
+    let cancelled = false
+    const apply = () => {
+      if (cancelled) return
+      setMonoFontReady((ready) => (ready ? ready : true))
+      if (terminalRef.current) {
+        terminalRef.current.options.fontFamily = MONO_STACK
+        terminalRef.current.options.fontSize = fontSize
+        performFit(true)
+      }
     }
-  }, [fontFamily, fontSize])
+
+    if (typeof document === 'undefined' || typeof document.fonts?.load !== 'function') {
+      apply()
+      return
+    }
+
+    // A hung Font Loading API must not keep monoFontReady false forever.
+    let timedOut = false
+    let timer = 0
+    const timeout = new Promise<void>((resolve) => {
+      timer = window.setTimeout(() => {
+        timedOut = true
+        resolve()
+      }, MONO_FONT_LOAD_TIMEOUT_MS)
+    })
+    const load = ensureMonoFontLoaded(fontSize).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      void logFrontendError({
+        level: 'warn',
+        source: 'ConnectedTerminal.font',
+        message: `Paper Mono failed to load — terminal uses the monospace fallback (${message})`
+      })
+    })
+
+    void Promise.race([load, timeout]).then(() => {
+      window.clearTimeout(timer)
+      if (timedOut) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'ConnectedTerminal.font',
+          message: 'Paper Mono load timed out — terminal uses the monospace fallback'
+        })
+      }
+      apply()
+    })
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [fontSize])
 
   // WebGL recovery state machine: attempt counters, context-loss/DPR
   // bookkeeping, dispose path, and the renderer-preference/DPR recovery
@@ -1465,13 +1514,14 @@ function ConnectedTerminalComponent({
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally narrow deps; a full list would recreate the terminal instance on every render
   useEffect(() => {
+    if (!monoFontReady) return
     if (!containerRef.current || !targetId) return
     if (didInitRef.current) return
     didInitRef.current = true
     initializedTerminalIdRef.current = targetId
     const terminalOptions = {
       ...getTerminalOptions(navigator.platform),
-      fontFamily,
+      fontFamily: MONO_STACK,
       fontSize,
       scrollback: bufferSize,
       screenReaderMode
@@ -1680,7 +1730,7 @@ function ConnectedTerminalComponent({
     targetId,
     autoSpawn,
     rendererPreference,
-    fontFamily,
+    monoFontReady,
     fontSize,
     bufferSize,
     instanceId,
@@ -1773,13 +1823,13 @@ function ConnectedTerminalComponent({
                   <div className="w-20 h-20 rounded-2xl bg-destructive/10 flex items-center justify-center mb-3 shadow-inner group-hover:scale-110 transition-transform duration-500">
                     <AlertTriangle className="text-destructive" size={40} />
                   </div>
-                  <span className="text-3xs uppercase tracking-[0.2em] font-black text-destructive/80 text-center">
-                    CRITICAL ERROR
+                  <span className="text-xs font-medium text-destructive text-center">
+                    Critical error
                   </span>
                 </div>
                 <div className="flex flex-col justify-center text-center md:text-left">
-                  <div className="mb-1 text-xs font-medium text-muted-foreground uppercase tracking-wider opacity-70">
-                    Terminal Pane Exception
+                  <div className="mb-1 text-xs font-medium text-muted-foreground">
+                    Terminal pane exception
                   </div>
                   <h3 className="text-2xl md:text-3xl font-bold tracking-tighter mb-3">
                     Session Interrupted
@@ -1823,13 +1873,13 @@ function ConnectedTerminalComponent({
                   <div className="w-20 h-20 rounded-2xl bg-warning/10 flex items-center justify-center mb-3 shadow-inner">
                     <AlertTriangle className="text-warning" size={40} />
                   </div>
-                  <span className="text-3xs uppercase tracking-[0.2em] font-black text-warning/80 text-center">
-                    SESSION ENDED
+                  <span className="text-xs font-medium text-warning text-center">
+                    Session ended
                   </span>
                 </div>
                 <div className="flex flex-col justify-center text-center md:text-left">
-                  <div className="mb-1 text-xs font-medium text-muted-foreground uppercase tracking-wider opacity-70">
-                    Server Restarted
+                  <div className="mb-1 text-xs font-medium text-muted-foreground">
+                    Server restarted
                   </div>
                   <h3 className="text-2xl md:text-3xl font-bold tracking-tighter mb-3">
                     server restarted — session ended

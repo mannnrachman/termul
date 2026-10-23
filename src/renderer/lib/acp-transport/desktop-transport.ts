@@ -7,10 +7,11 @@
  * heartbeat and reconnect — runs through the inherited {@link WsAcpTransport}
  * exactly as in the browser; only the socket differs ({@link ChannelSocket}).
  *
- * Stays on a Tauri `invoke` (no `/ws` equivalent, host-local by design):
- * registry snapshot/binary install, runtime + MCP probes and the ACP timeout
- * overrides. Dialogs, windows, browser consent and MCP OAuth start live in
- * `acp-api.ts`.
+ * Stays on a Tauri `invoke` (host-local by design): registry binary install,
+ * runtime + MCP probes and the ACP timeout overrides. The registry check also
+ * stays on its Tauri command, which calls the same host service as the `/ws`
+ * `fetch_acp_registry_snapshot` request. Dialogs, windows, browser consent
+ * and MCP OAuth start live in `acp-api.ts`.
  *
  * Desktop history stays in the Tauri store: `historyMode()` is `'tauri_store'`
  * whatever the relay negotiated, and no auth token is presented — the process
@@ -28,7 +29,7 @@ import type {
 import type { AcpRuntimeAvailability } from '@/lib/agents/supported-acp-agents'
 import { ChannelSocket } from './channel-socket'
 import { isDesktopLocalEvent, onDesktopLocalEvent } from './desktop-local-events'
-import { AcpTransportError, type SessionCursor } from './types'
+import { AcpTransportError, type AgentIdleWindowStatus, type SessionCursor } from './types'
 import { WsAcpTransport } from './ws-transport'
 
 /** Placeholder URL: the Channel carrier has no endpoint, but logs/diagnostics name one. */
@@ -93,8 +94,8 @@ export class DesktopAcpTransport extends WsAcpTransport {
     return invoke<ProbeResult>('acp_probe_mcp_server', { server })
   }
 
-  override fetchRegistrySnapshot(forceRefresh = false): Promise<AcpRegistrySnapshot> {
-    return invoke<AcpRegistrySnapshot>('acp_fetch_registry_snapshot', { forceRefresh })
+  override fetchRegistrySnapshot(): Promise<AcpRegistrySnapshot> {
+    return invoke<AcpRegistrySnapshot>('acp_fetch_registry_snapshot', { forceRefresh: true })
   }
 
   override setTurnTimeout(secs: number | null): Promise<void> {
@@ -111,5 +112,13 @@ export class DesktopAcpTransport extends WsAcpTransport {
 
   override setSessionReopenTimeout(secs: number | null): Promise<void> {
     return invoke<void>('acp_set_session_reopen_timeout', { secs })
+  }
+
+  override setAgentIdleWindow(secs: number | null): Promise<void> {
+    return invoke<void>('acp_set_agent_idle_window', { secs })
+  }
+
+  override getAgentIdleWindow(): Promise<AgentIdleWindowStatus> {
+    return invoke<AgentIdleWindowStatus>('acp_get_agent_idle_window')
   }
 }

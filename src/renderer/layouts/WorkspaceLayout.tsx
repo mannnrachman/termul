@@ -1,5 +1,6 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
+import { CanvasMountLayer } from '@/components/canvas/CanvasMountLayer'
 import { ShellFrame } from '@/components/shell/ShellFrame'
 import { WebTokenGateScreen } from '@/components/WebTokenGateScreen'
 import { useEditorPersistence } from '@/hooks/use-editor-persistence'
@@ -15,7 +16,6 @@ import { useBulkTabClose } from '@/layouts/workspace-layout/use-bulk-tab-close'
 import { useCloseActiveTab } from '@/layouts/workspace-layout/use-close-active-tab'
 import { useCommandPaletteData } from '@/layouts/workspace-layout/use-command-palette-data'
 import { useEditorTabClose } from '@/layouts/workspace-layout/use-editor-tab-close'
-import { useModalBrowserHide } from '@/layouts/workspace-layout/use-modal-browser-hide'
 import { useOverlayActions } from '@/layouts/workspace-layout/use-overlay-actions'
 import { useProjectRootWatch } from '@/layouts/workspace-layout/use-project-root-watch'
 import { useShortcutLabels } from '@/layouts/workspace-layout/use-shortcut-labels'
@@ -28,6 +28,7 @@ import { useWorkspaceKeyboard } from '@/layouts/workspace-layout/use-workspace-k
 import { WorkspaceLoadingScreen } from '@/layouts/workspace-layout/WorkspaceLoadingScreen'
 import { WorkspaceMain } from '@/layouts/workspace-layout/WorkspaceMain'
 import { WorkspaceModals } from '@/layouts/workspace-layout/WorkspaceModals'
+import { startCanvasGateway } from '@/lib/canvas-gateway'
 import { useWebAuthGate } from '@/lib/web-auth-gate'
 import { isWorkspaceRoutePath } from '@/lib/workspace-route'
 import { useGitSheetStore } from '@/stores/git-sheet-store'
@@ -75,6 +76,8 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const isMobileWebShell = useMobileWebShell()
   // The one agent-chat "Done" tracker for this renderer (AD-12).
   useShellUnreadTracker()
+  // This renderer's canvases answer agent canvas calls (spine AD-21).
+  useEffect(() => startCanvasGateway(), [])
   const { switchTo: switchProjectFromPalette } = useProjectSwitch('CommandPalette')
 
   const ssh = useSSHWorkspace()
@@ -115,7 +118,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const { closeActiveTab, handleCloseTerminalRef } = useCloseActiveTab({
     activeTab,
     isAgentLauncherOpen,
-    setDirtyCloseFilePath: editorTabClose.setDirtyCloseFilePath
+    closeEditorTab: editorTabClose.handleCloseEditorTab
   })
 
   // File watcher hook
@@ -177,8 +180,6 @@ export default function WorkspaceLayout(): React.JSX.Element {
     setIsNewProjectModalOpen
   })
 
-  useModalBrowserHide({ isNewProjectModalOpen, isAgentLauncherOpen, activeTab })
-
   const terminalClose = useTerminalClose({ activeProjectId, handleCloseTerminalRef })
   const bulkTabClose = useBulkTabClose({
     activeProjectId,
@@ -235,6 +236,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
       paletteData={paletteData}
       shortcutLabels={shortcutLabels}
       handleAddTerminal={tabOpeners.handleAddTerminal}
+      handleOpenTerminalProfile={tabOpeners.handleOpenTerminalProfile}
       handleLaunchAgent={tabOpeners.handleLaunchAgent}
       handleNewBrowserTab={handleNewBrowserTab}
       handleOpenCanvas={tabOpeners.handleOpenCanvas}
@@ -252,55 +254,69 @@ export default function WorkspaceLayout(): React.JSX.Element {
   // `!isLoaded` branch above only covers boot. Preserves #854: the gate
   // screen stays the only interactive surface until a valid token is
   // submitted. The swap unmounts the workspace, so state remounts cold
-  // after re-entry — the accepted trade for a dead token. Sits BEFORE the
+  // after re-entry — the accepted trade for a dead token. The canvas mount
+  // layer stays: its iframes hold the editors' documents (AD-19), and a
+  // fresh iframe under a session the store still calls ready would show an
+  // empty document that autosave could write over the file. Sits BEFORE the
   // mobile branch so web/PWA users get the same re-surface.
   if (webAuthGate.status === 'unauthorized') {
-    return <WebTokenGateScreen />
+    return (
+      <>
+        <WebTokenGateScreen />
+        <CanvasMountLayer key="canvas-mount-layer" />
+      </>
+    )
   }
 
   if (isMobileWebShell) {
     return (
-      <MobileWorkspaceShell
-        activeProject={activeProject}
-        activeProjectId={activeProjectId}
-        gitSheetOpen={gitSheetOpen}
-        gitSheetCwd={gitSheetCwd}
-        openGitSheet={openGitSheet}
-        closeGitSheet={closeGitSheet}
-        handleOpenAgentChat={tabOpeners.handleOpenAgentChat}
-        handleAddGitHistoryTab={tabOpeners.handleAddGitHistoryTab}
-        handleAddTerminal={tabOpeners.handleAddTerminal}
-        handleCloseTerminal={terminalClose.handleCloseTerminal}
-        handleCloseEditorTab={editorTabClose.handleCloseEditorTab}
-        handleOpenProjectSettings={overlayActions.handleOpenProjectSettings}
-        handleOpenCommandHistory={overlayActions.handleOpenCommandHistory}
-        handleCreateTerminalInPane={tabOpeners.handleCreateTerminalInPane}
-        setIsCommandPaletteOpen={setIsCommandPaletteOpen}
-        setIsNewProjectModalOpen={setIsNewProjectModalOpen}
-        workspaceMain={workspaceMain}
-        appModals={appModals}
-      />
+      <>
+        <MobileWorkspaceShell
+          activeProject={activeProject}
+          activeProjectId={activeProjectId}
+          gitSheetOpen={gitSheetOpen}
+          gitSheetCwd={gitSheetCwd}
+          openGitSheet={openGitSheet}
+          closeGitSheet={closeGitSheet}
+          handleOpenAgentChat={tabOpeners.handleOpenAgentChat}
+          handleAddGitHistoryTab={tabOpeners.handleAddGitHistoryTab}
+          handleAddTerminal={tabOpeners.handleAddTerminal}
+          handleCloseTerminal={terminalClose.handleCloseTerminal}
+          handleCloseEditorTab={editorTabClose.handleCloseEditorTab}
+          handleOpenProjectSettings={overlayActions.handleOpenProjectSettings}
+          handleOpenCommandHistory={overlayActions.handleOpenCommandHistory}
+          handleCreateTerminalInPane={tabOpeners.handleCreateTerminalInPane}
+          setIsCommandPaletteOpen={setIsCommandPaletteOpen}
+          setIsNewProjectModalOpen={setIsNewProjectModalOpen}
+          workspaceMain={workspaceMain}
+          appModals={appModals}
+        />
+        <CanvasMountLayer key="canvas-mount-layer" />
+      </>
     )
   }
 
   return (
-    <ShellFrame
-      projects={projects}
-      activeProject={activeProject}
-      activeProjectId={activeProjectId}
-      ssh={ssh}
-      isShortcutMenuOpen={isShortcutMenuOpen}
-      setIsShortcutMenuOpen={setIsShortcutMenuOpen}
-      setIsCommandPaletteOpen={setIsCommandPaletteOpen}
-      setIsNewProjectModalOpen={setIsNewProjectModalOpen}
-      onSelectProject={handleSelectProject}
-      handleAddGitTab={tabOpeners.handleAddGitTab}
-      handleAddGitHistoryTab={tabOpeners.handleAddGitHistoryTab}
-      handleToggleThemePicker={handleToggleThemePicker}
-      handleOpenAgentChat={tabOpeners.handleOpenAgentChat}
-      handleOpenCanvas={tabOpeners.handleOpenCanvas}
-      workspaceMain={workspaceMain}
-      appModals={appModals}
-    />
+    <>
+      <ShellFrame
+        projects={projects}
+        activeProject={activeProject}
+        activeProjectId={activeProjectId}
+        ssh={ssh}
+        isShortcutMenuOpen={isShortcutMenuOpen}
+        setIsShortcutMenuOpen={setIsShortcutMenuOpen}
+        setIsCommandPaletteOpen={setIsCommandPaletteOpen}
+        setIsNewProjectModalOpen={setIsNewProjectModalOpen}
+        onSelectProject={handleSelectProject}
+        handleAddGitTab={tabOpeners.handleAddGitTab}
+        handleAddGitHistoryTab={tabOpeners.handleAddGitHistoryTab}
+        handleToggleThemePicker={handleToggleThemePicker}
+        handleOpenAgentChat={tabOpeners.handleOpenAgentChat}
+        handleOpenCanvas={tabOpeners.handleOpenCanvas}
+        workspaceMain={workspaceMain}
+        appModals={appModals}
+      />
+      <CanvasMountLayer key="canvas-mount-layer" />
+    </>
   )
 }

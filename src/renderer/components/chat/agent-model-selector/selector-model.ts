@@ -1,7 +1,8 @@
 import type { PersistedModelCatalog } from '@shared/types/persistence.types'
 import type { StoredAgentConfig } from '@/lib/acp-agents-persistence'
-import type { SessionConfigOption, SessionModelState } from '@/lib/acp-api'
+import type { AgentCapabilities, SessionConfigOption, SessionModelState } from '@/lib/acp-api'
 import type { SupportedAcpAgentEntry } from '@/lib/agents/supported-acp-agents'
+import { flattenConfigOptionValues } from '../chat-input-bar-config'
 
 /** Tabs shown in the agent track before the rest go behind "More". */
 export const MAX_VISIBLE_AGENT_TABS = 4
@@ -27,14 +28,42 @@ export interface ModelCatalog {
   currentValue: string | null
 }
 
-/** Catalog entries of a config option: only the ones with a string value
- * (boolean options carry none; groups are not model rows). */
+/**
+ * What an agent advertised at `initialize`, one line per capability block,
+ * for the tooltip on that agent's model rows. Text and stdio are the ACP
+ * baseline every agent supports, so a line appears only when the agent sent
+ * that block. Null when it sent neither.
+ */
+export function capabilitySummary(
+  capabilities: AgentCapabilities | null | undefined
+): string | null {
+  const lines: string[] = []
+  const prompt = capabilities?.promptCapabilities
+  if (prompt) {
+    const extras: string[] = []
+    if (prompt.image) extras.push('Images')
+    if (prompt.audio) extras.push('Audio (cannot attach yet)')
+    if (prompt.embeddedContext) extras.push('Embedded context')
+    lines.push(`Accepts: ${extras.length > 0 ? ['Text', ...extras].join(' · ') : 'Text only'}`)
+  }
+  const mcp = capabilities?.mcpCapabilities
+  if (mcp) {
+    const extras: string[] = []
+    if (mcp.http) extras.push('HTTP')
+    if (mcp.sse) extras.push('SSE')
+    lines.push(
+      `MCP servers: ${extras.length > 0 ? ['stdio', ...extras].join(' · ') : 'stdio only'}`
+    )
+  }
+  return lines.length > 0 ? lines.join('\n') : null
+}
+
 export function catalogModels(option: SessionConfigOption): CatalogModel[] {
-  return (option.options ?? []).flatMap((entry) =>
-    typeof entry.value === 'string'
-      ? [{ value: entry.value, name: entry.name, description: entry.description ?? null }]
-      : []
-  )
+  return flattenConfigOptionValues(option).map(({ value, name, description }) => ({
+    value,
+    name,
+    description: description ?? null
+  }))
 }
 
 export function catalogFromSessionState(

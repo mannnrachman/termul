@@ -55,62 +55,51 @@ pub(super) fn gate_mcp_servers(
     Ok(())
 }
 
-/// Inject OAuth Bearer tokens into HTTP/SSE MCP server configs before `session/new`. The token is loaded from the file store (written by `acp_mcp_oauth_start`). Only injects if the server has no existing Authorization header — never overrides a user-configured token.
-pub(super) fn inject_oauth_tokens(mcp_servers: Vec<McpServer>) -> Vec<McpServer> {
-    mcp_servers
-        .into_iter()
-        .map(|server| match server {
+/// Inject OAuth Bearer tokens into HTTP/SSE MCP server configs before `session/new`. The token is loaded from the file store (written by `acp_mcp_oauth_start`) and refreshed when it has expired. Only injects if the server has no existing Authorization header — never overrides a user-configured token.
+pub(super) async fn inject_oauth_tokens(mcp_servers: Vec<McpServer>) -> Vec<McpServer> {
+    let mut injected = Vec::with_capacity(mcp_servers.len());
+    for server in mcp_servers {
+        injected.push(match server {
             McpServer::Http(mut http) => {
-                if !http
-                    .headers
-                    .iter()
-                    .any(|h| h.name.eq_ignore_ascii_case("Authorization"))
-                {
-                    match crate::acp::mcp_oauth::get_valid_token_blocking(&http.url) {
-                        Ok(Some(token)) => {
-                            http.headers
-                                .push(agent_client_protocol::schema::v1::HttpHeader::new(
-                                    "Authorization",
-                                    format!("Bearer {token}"),
-                                ));
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::warn!(
-                                "[mcp-oauth] token lookup failed for MCP server (url redacted): {e}"
-                            );
-                        }
-                    }
+                if let Some(header) = oauth_header(&http.url, &http.headers).await {
+                    http.headers.push(header);
                 }
                 McpServer::Http(http)
             }
             McpServer::Sse(mut sse) => {
-                if !sse
-                    .headers
-                    .iter()
-                    .any(|h| h.name.eq_ignore_ascii_case("Authorization"))
-                {
-                    match crate::acp::mcp_oauth::get_valid_token_blocking(&sse.url) {
-                        Ok(Some(token)) => {
-                            sse.headers
-                                .push(agent_client_protocol::schema::v1::HttpHeader::new(
-                                    "Authorization",
-                                    format!("Bearer {token}"),
-                                ));
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            log::warn!(
-                                "[mcp-oauth] token lookup failed for MCP server (url redacted): {e}"
-                            );
-                        }
-                    }
+                if let Some(header) = oauth_header(&sse.url, &sse.headers).await {
+                    sse.headers.push(header);
                 }
                 McpServer::Sse(sse)
             }
             other => other,
-        })
-        .collect()
+        });
+    }
+    injected
+}
+
+async fn oauth_header(
+    url: &str,
+    headers: &[agent_client_protocol::schema::v1::HttpHeader],
+) -> Option<agent_client_protocol::schema::v1::HttpHeader> {
+    if headers
+        .iter()
+        .any(|h| h.name.eq_ignore_ascii_case("Authorization"))
+    {
+        return None;
+    }
+    match crate::acp::mcp_oauth::get_valid_token(url).await {
+        Ok(token) => token.map(|token| {
+            agent_client_protocol::schema::v1::HttpHeader::new(
+                "Authorization",
+                format!("Bearer {token}"),
+            )
+        }),
+        Err(e) => {
+            log::warn!("[mcp-oauth] token lookup failed for MCP server (url redacted): {e}");
+            None
+        }
+    }
 }
 
 /// Build the internal `termul` MCP server config (for the `plan` tool; stdio self-spawn) to
@@ -472,6 +461,10 @@ pub(super) struct AgentRuntimeProfile {
     /// summarized thinking display. The chat already renders `agent_thought_chunk`
     /// as a Thought row.
     pub(super) summarize_thinking: bool,
+    /// Claude Agent ACP versions that send native subagent sessions in the
+    /// AIR draft form: advertise `subagents` so each subagent reports its
+    /// real end (`native_subagents.rs`).
+    pub(super) native_subagents: bool,
 }
 
 /// True for the managed Claude ACP agent and for a process launched from the
@@ -509,6 +502,8 @@ impl AgentRuntimeProfile {
             lenient_config_option_ack: factory_droid,
             mask_failure_details: factory_droid,
             summarize_thinking: requests_summarized_thinking(config),
+            native_subagents: requests_summarized_thinking(config)
+                && super::native_subagents::uses_air_native_subagents(config),
         }
     }
 }

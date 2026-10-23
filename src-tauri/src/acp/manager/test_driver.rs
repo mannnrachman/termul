@@ -189,6 +189,7 @@ impl FakeDriver {
                     &session_id,
                     turn_id,
                     events::TurnFailureStop::Error.into(),
+                    None,
                 );
             }
             let _ = accepted.send(Err(error.clone()));
@@ -220,6 +221,7 @@ impl FakeDriver {
                     "chunk",
                 )),
                 message_id: None,
+                parent_tool_call_id: None,
             };
             events::fan_out(
                 &self.sinks,

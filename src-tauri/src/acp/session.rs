@@ -14,7 +14,9 @@
 //! handler closures require; in practice all access happens on the one driver
 //! thread, so the lock is uncontended.
 
-use agent_client_protocol::schema::v1::{CreateElicitationResponse, RequestPermissionResponse};
+use agent_client_protocol::schema::v1::{
+    AvailableCommand, CreateElicitationResponse, RequestPermissionResponse,
+};
 use agent_client_protocol::Responder;
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -26,7 +28,10 @@ use tokio::sync::{oneshot, watch};
 use crate::acp::session_persistence::SessionRegistration;
 
 mod activity;
+mod commands;
+mod subagents;
 pub(crate) use activity::ActivityClock;
+pub(crate) use subagents::ChildRoute;
 pub use activity::AgentActivity;
 
 /// A permission request awaiting the user's decision.
@@ -136,6 +141,12 @@ pub(crate) struct DriverState {
     /// When this agent last showed host-observed activity (see
     /// [`AgentActivity`]). The idle reaper's only clock.
     last_active: ActivityClock,
+    /// Last `available_commands_update` set fanned out per session, so a
+    /// repeat is dropped before it takes a seq. Forgotten when a replay
+    /// window opens (load/resume) and in `remove_session_root`.
+    last_commands: commands::LastCommands,
+    /// Native subagent child sessions and the chat each one belongs to.
+    subagents: subagents::SubagentRoutes,
 }
 
 /// State of one session's replay window: how many reopens are in flight and
@@ -404,9 +415,11 @@ impl DriverState {
         self.ephemeral_sessions.insert(session_id);
     }
 
+    /// A native subagent session takes the mark of the chat it belongs to.
     #[must_use]
     pub(crate) fn is_ephemeral(&self, session_id: &str) -> bool {
-        self.ephemeral_sessions.contains(session_id)
+        self.ephemeral_sessions
+            .contains(self.subagents.root_of(session_id))
     }
 
     /// Stash the durable registration metadata for a backend-ephemeral session
@@ -432,9 +445,12 @@ impl DriverState {
         self.promotable_sessions.remove(session_id);
     }
 
-    /// Look up the canonicalized workspace root for a session, if known.
+    /// Look up the canonicalized workspace root for a session, if known. A
+    /// native subagent session uses the root of the chat it belongs to.
     pub(crate) fn session_root(&self, session_id: &str) -> Option<PathBuf> {
-        self.session_roots.get(session_id).cloned()
+        self.session_roots
+            .get(self.subagents.root_of(session_id))
+            .cloned()
     }
 
     /// Begin closing a session: report whether it was ephemeral — captured
@@ -459,6 +475,19 @@ impl DriverState {
         self.model_config_ids.remove(session_id);
         self.legacy_model_sessions.remove(session_id);
         self.promotable_sessions.remove(session_id);
+        self.last_commands.forget(session_id);
+        self.subagents.forget_root(session_id);
+    }
+
+    /// Whether an `available_commands_update` repeats the set last fanned
+    /// out for the session (order-insensitive). The caller drops a repeat
+    /// before it touches the idle clock or allocates a seq.
+    pub(crate) fn is_repeated_commands_update(
+        &mut self,
+        session_id: &str,
+        commands: &[AvailableCommand],
+    ) -> bool {
+        self.last_commands.is_repeat(session_id, commands)
     }
 
     /// Record the agent-advertised configId of the Model selector for a session
@@ -502,6 +531,8 @@ impl DriverState {
             return false;
         }
         self.last_active.touch();
+        // The reopened session re-advertises its commands: fan that out.
+        self.last_commands.forget(session_id);
         self.replay_windows
             .entry(session_id.to_string())
             .or_default()
@@ -790,3 +821,6 @@ impl DriverState {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod subagents_tests;

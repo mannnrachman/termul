@@ -714,6 +714,75 @@ async fn list_preserved_returns_terminals_and_fresh_claims_for_authed_connection
     }
 }
 
+/// `list_preserved {projectId, terminalId}` re-issues only that terminal's
+/// claim (lost-rotation recovery), so a sibling's original claim still
+/// attaches.
+#[tokio::test]
+async fn list_preserved_scoped_to_one_terminal_keeps_sibling_claims() {
+    let state = gate_test_state(None);
+    let (tx, _rx) = mpsc::channel(16);
+    let mut owner = gate_test_ctx(true);
+    let mut spawned = Vec::new();
+    for request_id in ["s1", "s2"] {
+        let reply = handle(
+            gate_request(request_id, "spawn", json!({"projectId": "project-a"})),
+            &state,
+            &tx,
+            &mut owner,
+        )
+        .await
+        .expect("spawn");
+        spawned.push((
+            reply["id"].as_str().unwrap().to_string(),
+            reply["claim"].as_str().unwrap().to_string(),
+        ));
+    }
+    let [(id_a, _), (id_b, claim_b)] = [spawned[0].clone(), spawned[1].clone()];
+
+    let listed = handle(
+        gate_request(
+            "lp",
+            "list_preserved",
+            json!({"projectId": "project-a", "terminalId": id_a}),
+        ),
+        &state,
+        &tx,
+        &mut owner,
+    )
+    .await
+    .expect("list_preserved succeeds");
+    let attach_b = handle(
+        gate_request(
+            "at",
+            "attach",
+            json!({"terminalId": id_b, "claim": claim_b, "lastSeq": 0}),
+        ),
+        &state,
+        &tx,
+        &mut owner,
+    )
+    .await;
+
+    let ids: Vec<&str> = listed["terminals"]
+        .as_array()
+        .expect("terminals array")
+        .iter()
+        .filter_map(|t| t["id"].as_str())
+        .collect();
+    assert_eq!(ids, [id_a.as_str()]);
+    assert!(attach_b.is_ok(), "the sibling's claim still attaches: {attach_b:?}");
+
+    for (terminal_id, _) in &spawned {
+        let _ = handle(
+            gate_request("k", "kill", json!({"terminalId": terminal_id})),
+            &state,
+            &tx,
+            &mut owner,
+        )
+        .await;
+    }
+}
+
 /// Story 5 no-leak bars, pinned in-module:
 /// 1. Pre-auth `list_preserved` takes the connection gate's single
 ///    generic UNAUTHORIZED (never a VALIDATION_ERROR or a count) — no
@@ -1011,12 +1080,12 @@ fn live_attachments(state: &crate::web::ws::AppState, terminal_id: &str) -> usiz
         .pty
         .get(terminal_id)
         .expect("terminal exists")
-        .web_attachments
+        .live_attachments
         .load(Ordering::Acquire)
 }
 
 /// PTY-F1: attaching the same terminal twice on ONE connection used to leak a
-/// `web_attachments` count (the replaced forwarder was aborted without its
+/// `live_attachments` count (the replaced forwarder was aborted without its
 /// release), so the terminal reported a live attachment forever after the
 /// socket closed and was never auto-reaped.
 #[tokio::test]
@@ -1046,7 +1115,7 @@ async fn audit_f1_reattach_same_connection_leaks_attachment_count() {
     // Socket closes: cleanup releases the single live attachment.
     conn.release_all(&state);
     assert_eq!(live_attachments(&state, &id), 0);
-    assert!(!state.pty.get(&id).unwrap().has_web_attachment());
+    assert!(!state.pty.get(&id).unwrap().has_live_attachment());
     let _ = state.pty.force_kill(&id).await;
 }
 
@@ -1083,7 +1152,7 @@ async fn reattach_swap_never_exposes_a_zero_attachment_count() {
             let (mut samples, mut zero_seen, mut max_count) = (0u64, false, 0usize);
             polling.store(true, Ordering::Release);
             while !stop.load(Ordering::Acquire) {
-                let count = instance.web_attachments.load(Ordering::Acquire);
+                let count = instance.live_attachments.load(Ordering::Acquire);
                 samples += 1;
                 zero_seen |= count == 0;
                 max_count = max_count.max(count);
